@@ -1,0 +1,27 @@
+[project]
+name = "mne-grade-manager"
+version = "0.3.0"
+description = "Grade manager for M1/M2 programs with configurable templates"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.7",
+    "openpyxl>=3.1",
+    "pypdf>=4.0",
+    "reportlab>=4.0",
+    "opencv-python-headless>=4.13.0.92",
+    "Pillow>=12.2.0",
+]
+
+[project.scripts]
+mne-grade-manager = "mne_grade_manager.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
