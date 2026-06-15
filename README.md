@@ -1,5 +1,7 @@
 # MNE Grade Manager V3
 
+Database manager for the MNE master program.
+
 Base de projet Python + PySide6 + SQLite pour gérer :
 - étudiants
 - cours
