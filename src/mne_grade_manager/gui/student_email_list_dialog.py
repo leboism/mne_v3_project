@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QRadioButton,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..services.mailto_client import open_default_mail_client
 from ..services.student_emails import (
     EMAIL_FORMAT_COMMA,
     EMAIL_FORMAT_LINES,
@@ -44,12 +46,13 @@ class StudentEmailListDialog(QDialog):
         super().__init__(parent)
         self._filtered = list(filtered_students)
         self._selected = list(selected_students)
-        self.setWindowTitle("Liste d'e-mails")
+        self.setWindowTitle("Mailing liste — e-mails étudiants")
         root = QVBoxLayout(self)
 
         hint = QLabel(
             "Composez une liste d'adresses à partir des étudiants affichés ou de la sélection. "
-            "Modifiez le texte librement, puis copiez-le dans le champ Cci de votre client mail."
+            "Renseignez objet et message, puis ouvrez votre client mail (destinataires en Cci) "
+            "ou copiez la liste pour un envoi manuel."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: palette(mid); font-size: 11px;")
@@ -90,20 +93,36 @@ class StudentEmailListDialog(QDialog):
 
         root.addLayout(form)
 
+        self.subject_edit = QLineEdit()
+        self.subject_edit.setPlaceholderText("Objet du message (optionnel)")
+        form.addRow("Objet :", self.subject_edit)
+
+        self.body_edit = QTextEdit()
+        self.body_edit.setPlaceholderText("Corps du message (optionnel)")
+        self.body_edit.setMaximumHeight(120)
+        form.addRow("Message :", self.body_edit)
+
         self.summary_label = QLabel()
         self.summary_label.setWordWrap(True)
         root.addWidget(self.summary_label)
 
         self.emails_edit = QTextEdit()
         self.emails_edit.setPlaceholderText("Les adresses apparaîtront ici…")
+        self.emails_edit.textChanged.connect(self._update_summary_from_editor)
         root.addWidget(self.emails_edit, 1)
 
         action_row = QHBoxLayout()
         self.refresh_btn = QPushButton("Actualiser")
         self.refresh_btn.clicked.connect(self._refresh_list)
+        self.open_mail_btn = QPushButton("Ouvrir dans le client mail (Cci)")
+        self.open_mail_btn.setToolTip(
+            "Ouvre le client mail par défaut avec les adresses en Cci, l'objet et le message."
+        )
+        self.open_mail_btn.clicked.connect(self._open_in_mail_app)
         self.copy_btn = QPushButton("Copier la liste")
         self.copy_btn.clicked.connect(self._copy)
         action_row.addWidget(self.refresh_btn)
+        action_row.addWidget(self.open_mail_btn)
         action_row.addWidget(self.copy_btn)
         action_row.addStretch()
         root.addLayout(action_row)
@@ -124,12 +143,27 @@ class StudentEmailListDialog(QDialog):
 
         from .screen_layout import adapt_window_size
 
-        adapt_window_size(self, preferred=(640, 480), minimum=(480, 360))
+        adapt_window_size(self, preferred=(720, 560), minimum=(520, 420))
 
     def _current_students(self) -> list[dict[str, Any]]:
         if self.scope_selected.isEnabled() and self.scope_selected.isChecked():
             return self._selected
         return self._filtered
+
+    def _emails_from_editor(self) -> list[str]:
+        return parse_email_block(self.emails_edit.toPlainText())
+
+    def _update_summary_from_editor(self) -> None:
+        emails = self._emails_from_editor()
+        students_n = len(self._current_students())
+        if emails:
+            self.summary_label.setText(
+                f"{len(emails)} adresse(s) dans la liste ({students_n} étudiant(s) dans le périmètre)."
+            )
+        elif students_n:
+            self.summary_label.setText(
+                f"{students_n} étudiant(s) dans le périmètre — actualisez pour générer les adresses."
+            )
 
     def _refresh_list(self) -> None:
         students = self._current_students()
@@ -139,7 +173,6 @@ class StudentEmailListDialog(QDialog):
         self.emails_edit.blockSignals(True)
         self.emails_edit.setPlainText(format_email_block(emails, fmt))
         self.emails_edit.blockSignals(False)
-
         if not students:
             self.summary_label.setText("Aucun étudiant dans ce périmètre.")
         elif not emails:
@@ -156,9 +189,7 @@ class StudentEmailListDialog(QDialog):
                 f"Sans adresse : {names}{extra}."
             )
         else:
-            self.summary_label.setText(
-                f"{len(emails)} adresse(s) pour {len(students)} étudiant(s)."
-            )
+            self._update_summary_from_editor()
 
     def _on_format_changed(self) -> None:
         students = self._current_students()
@@ -168,6 +199,29 @@ class StudentEmailListDialog(QDialog):
         self.emails_edit.blockSignals(True)
         self.emails_edit.setPlainText(format_email_block(emails, fmt))
         self.emails_edit.blockSignals(False)
+        self._update_summary_from_editor()
+
+    def _open_in_mail_app(self) -> None:
+        emails = self._emails_from_editor()
+        if not emails:
+            QMessageBox.information(
+                self,
+                "E-mail",
+                "Aucune adresse dans la liste. Actualisez ou saisissez des adresses.",
+            )
+            return
+        subject = self.subject_edit.text().strip()
+        body = self.body_edit.toPlainText().strip()
+        result = open_default_mail_client(
+            bcc=emails,
+            subject=subject,
+            body=body,
+            clipboard=QGuiApplication.clipboard(),
+        )
+        if result.opened:
+            QMessageBox.information(self, "E-mail", result.message)
+        else:
+            QMessageBox.warning(self, "E-mail", result.message)
 
     def _copy(self) -> None:
         text = self.emails_edit.toPlainText().strip()

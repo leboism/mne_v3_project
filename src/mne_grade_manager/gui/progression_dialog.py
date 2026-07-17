@@ -54,7 +54,10 @@ class StudentProgressionDialog(QDialog):
             QLabel(
                 "L’étudiant passe en <b>M2</b> sur la <b>même fiche</b> (pas de doublon) : "
                 "l’inscription M1 est conservée pour l’historique ; une inscription à la maquette M2 "
-                "est ajoutée. Les <b>notes M1 restent en base</b>."
+                "est ajoutée. Les <b>notes M1 restent en base</b>.<br>"
+                "Le <b>contrat pédagogique M1</b> (PDF et version papier) est effacé : "
+                "un nouveau contrat M2 devra être déposé sur la fiche.<br>"
+                "La <b>maquette M2</b> du millésime cible doit exister (onglet Maquette)."
             )
         )
         m2_l.addWidget(QLabel("Choisissez le parcours M2 (NPD, DWM, etc.)."))

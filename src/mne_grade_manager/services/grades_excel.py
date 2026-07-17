@@ -95,6 +95,8 @@ def write_grades_workbook(
                             g.get("grade"),
                             g.get("status"),
                             assessment_session=int(a.get("session") or 1),
+                            assessment_kind=str(a.get("kind") or ""),
+                            assessment_name=str(a.get("name") or ""),
                         )
                     )
                 else:

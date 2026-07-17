@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Checklist de tests — MNE Grade Manager V3</title>
+<style>
+body { font-family: Calibri, Arial, sans-serif; font-size: 11pt; line-height: 1.35; margin: 2cm; }
+h1 { text-align: center; font-size: 20pt; }
+h2 { font-size: 14pt; margin-top: 18pt; color: #1a3a5c; border-bottom: 1px solid #ccc; padding-bottom: 4pt; }
+h3 { font-size: 12pt; margin-top: 14pt; color: #333; }
+.subtitle { text-align: center; font-style: italic; color: #555; }
+.note { background: #f5f8fc; padding: 8pt 12pt; border-left: 4px solid #2c5aa0; margin: 12pt 0; }
+ul.checklist { list-style: none; padding-left: 0; }
+ul.checklist li { margin: 4pt 0; }
+ul.checklist li:before { content: "☐  "; }
+ol.steps li { margin: 4pt 0; }
+table { border-collapse: collapse; width: 100%; margin: 12pt 0; }
+th, td { border: 1px solid #999; padding: 6pt 8pt; text-align: left; vertical-align: top; }
+th { background: #e8eef5; }
+code, .example { font-family: Consolas, monospace; font-size: 10pt; background: #f4f4f4; padding: 2pt 4pt; }
+.footer { margin-top: 24pt; font-style: italic; color: #666; font-size: 10pt; }
+</style>
+</head>
+<body>
+
+<h1>MNE Grade Manager V3</h1>
+<p class="subtitle">Checklist de tests — convergence vers une version utilisable</p>
+<p class="subtitle">Priorité : Mac d'abord — Windows en dernier</p>
+
+<div class="note">
+<strong>Ordre recommandé :</strong>
+<ol class="steps">
+<li>Un scénario bout-en-bout complet sur <strong>données de démo</strong></li>
+<li>Le même scénario sur <strong>vos vrais fichiers Excel/PDF</strong> (2025-2026 ou 2026-2027)</li>
+<li>Les cas limites et fin d'année</li>
+<li><strong>Windows en dernier</strong> (build + transfert zip)</li>
+</ol>
+<p><strong>Critère « prêt pour collègues » :</strong> les cases P0 sont toutes vertes, au moins 80&nbsp;% des P1, et vous avez fait une sauvegarde/restauration sans perte.</p>
+</div>
+
+<h2>Phase 1 — Socle (P0, à faire en premier)</h2>
+
+<h3>Démarrage &amp; millésime</h3>
+<ul class="checklist">
+<li>Lancement : <code>PYTHONPATH=src .venv/bin/python -m mne_grade_manager.main</code></li>
+<li>Écran d'accueil : ouvrir le millésime <strong>2026-2027</strong> (ou celui que vous utilisez vraiment)</li>
+<li>Ajouter un millésime manquant → il apparaît et s'ouvre</li>
+<li><strong>Retour à l'accueil</strong> puis réouverture → données intactes</li>
+<li>Bandeau titre affiche le bon millésime</li>
+</ul>
+
+<h3>Sauvegarde / restauration (indispensable avant de confier l'outil)</h3>
+<ul class="checklist">
+<li><strong>Fichier → Exporter les données (transfert)</strong> → zip créé sans erreur</li>
+<li>Modifier quelque chose (ex. un étudiant), <strong>Importer</strong> le zip → données restaurées, modification annulée</li>
+<li>Vérifier qu'une <strong>photo</strong> ou <strong>PDF joint</strong> survit à l'export/import</li>
+<li><strong>Enregistrer la base SQLite seule</strong> → fichier cohérent</li>
+</ul>
+
+<h3>Données de démo (référence rapide)</h3>
+<ul class="checklist">
+<li><strong>Fichier → Créer des données de démo</strong> sur un millésime vierge</li>
+<li>Parcourir tous les onglets sans crash</li>
+<li>Repérer ce qui est « fictif » vs ce que vous attendez en prod</li>
+</ul>
+
+<h2>Phase 2 — Secrétariat (P0 / P1)</h2>
+
+<h3>Étudiants</h3>
+<ul class="checklist">
+<li><strong>Ajouter</strong> un étudiant manuellement → visible dans la liste</li>
+<li><strong>Fiche</strong> : photo, pièces jointes, coordonnées → enregistrement OK</li>
+<li><strong>Modifier</strong> niveau / parcours / e-mail</li>
+<li>Filtres : année, niveau, parcours, recherche nom, contrat péd., actifs/démissionnaires</li>
+<li><strong>Modèle d'import Excel</strong> → colonnes attendues</li>
+<li><strong>Importer Excel</strong> (votre fichier réel) → pas d'erreur bloquante, effectifs cohérents</li>
+<li>Ré-import sur le même fichier → mise à jour sans doublons aberrants</li>
+<li><strong>Exporter Excel</strong> de la liste filtrée → ouvre dans Excel</li>
+<li><strong>Démissionnaire</strong> puis filtre « Démissionnaires » → <strong>Réintégrer</strong></li>
+<li><strong>Liste d'e-mails</strong> → adresses exploitables pour un mail groupé</li>
+<li><strong>Importer dossiers candidature (PDF)</strong> sur 2–3 vrais PDF → champs extraits plausibles</li>
+</ul>
+
+<h3>Maquette</h3>
+<ul class="checklist">
+<li>Importer la maquette <strong>M1 P</strong>, <strong>M1 C</strong>, <strong>M2</strong> (fichiers officiels)</li>
+<li>Vérifier UE, ECTS, heures après import</li>
+<li><strong>Dupliquer</strong> ou <strong>reporter vers l'année suivante</strong> (ne pas modifier l'ancienne)</li>
+<li><strong>Exporter Excel</strong> → fichier lisible</li>
+<li>Après import maquette : onglet <strong>Cours</strong> reflète les UE</li>
+</ul>
+
+<h3>Emploi du temps</h3>
+<ul class="checklist">
+<li>Import <strong>M1</strong> (Physique + Chimie) → grille, couleurs, heures en bas</li>
+<li>Navigation <strong>S1 ↔ S2</strong> (M1)</li>
+<li>Import <strong>M2</strong> → parcours Common (X) forcé</li>
+<li>M2 : <strong>S1</strong>, <strong>S2</strong> (janv.–juin), <strong>S3</strong> (été) — même si S3 vide pour l'instant</li>
+<li>Fenêtre de semaines <strong>◀ ▶</strong> si beaucoup de colonnes</li>
+<li><strong>Ré-import</strong> remplace l'ancien (même millésime/niveau)</li>
+<li><strong>Supprimer l'emploi du temps</strong> puis ré-importer</li>
+<li>Écart heures planifiées / prévues : valeurs plausibles ou « — » si pas de référentiel</li>
+</ul>
+
+<h3>Équipe du master</h3>
+<ul class="checklist">
+<li><strong>Fichier → Équipe du master</strong> : directeurs, responsables parcours, secrétariats</li>
+<li>Enregistrement → rouvrir la fenêtre → données conservées</li>
+</ul>
+
+<h2>Phase 3 — Coordination pédagogique (P1)</h2>
+
+<h3>Cours</h3>
+<ul class="checklist">
+<li>Arborescence M1/M2 → fiche UE (enseignant, syllabus)</li>
+<li>Lien maquette ↔ cours cohérent après imports</li>
+</ul>
+
+<h3>Notes</h3>
+<ul class="checklist">
+<li>Sélection maquette / étudiant / cours / évaluation</li>
+<li>Saisie de notes → <strong>moyenne</strong> recalculée</li>
+<li>Navigation clavier / passage ligne suivante</li>
+<li>Message ou garde-fou si <strong>non enregistré</strong> avant changement de sélection</li>
+<li>Cas <strong>ABI / ABJ / DEF</strong> / session 2 si vous les utilisez cette année</li>
+</ul>
+
+<h3>Résultats</h3>
+<ul class="checklist">
+<li>Tableau synthèse par étudiant après saisie de notes</li>
+<li>Filtres niveau / parcours / validation</li>
+<li><strong>Export CSV</strong> → exploitable (Excel, séparateur, encodage accents)</li>
+</ul>
+
+<h3>PV &amp; délibérations</h3>
+<ul class="checklist">
+<li>Créer une délibération <strong>S1</strong>, <strong>S2</strong>, <strong>Finale</strong> pour un parcours test</li>
+<li>Composition du jury (manuel + import Excel modèle si vous l'utilisez)</li>
+<li><strong>Délibération</strong> : décisions par étudiant</li>
+<li>M1 : <strong>Admis M2</strong> / <strong>Redoublement</strong> → <strong>Appliquer sur la fiche</strong></li>
+<li>M2 : <strong>Année validée</strong> → statut <strong>diplômé</strong> sur la fiche</li>
+<li>Action groupée <strong>Appliquer progressions M2 / redoublement / diplômé</strong></li>
+<li>Exports PDF : PV, matrice de notes, relevé — fichiers non vides, mise en page acceptable</li>
+<li><strong>Passage M2 / redoublement</strong> (menu Étudiants) cohérent avec le jury</li>
+</ul>
+
+<h3>Statistiques</h3>
+<ul class="checklist">
+<li>Effectifs, nationalités, taux de réussite : chiffres plausibles</li>
+<li>Export CSV</li>
+</ul>
+
+<h3>Convocations d'examen</h3>
+<ul class="checklist">
+<li>Sélection cours / étudiants</li>
+<li>Objet mail avec code MNE</li>
+<li><strong>Ouvrir dans l'app mail</strong> → destinataires en Cci (Mail sur Mac)</li>
+</ul>
+
+<h2>Phase 4 — Scénarios bout-en-bout (P0 avant juillet)</h2>
+
+<h3>Début d'année</h3>
+<ol class="steps">
+<li>Ouvrir millésime</li>
+<li>Exporter (archive de départ)</li>
+<li>Importer étudiants</li>
+<li>Importer maquettes M1 + M2</li>
+<li>Importer emplois du temps</li>
+<li>Compléter équipe du master</li>
+<li>Vérifier effectifs et 5 fiches étudiants au hasard</li>
+</ol>
+
+<h3>Milieu d'année</h3>
+<ol class="steps">
+<li>Mise à jour Excel étudiants (changement e-mail / parcours)</li>
+<li>Ré-import emploi du temps révisé</li>
+<li>Saisie notes session 1 sur 2 UE</li>
+<li>Export CSV résultats + contrôle manuel des moyennes</li>
+</ol>
+
+<h3>Fin d'année</h3>
+<ol class="steps">
+<li>Délibération S1 puis S2 ou finale</li>
+<li>Appliquer progressions</li>
+<li>Marquer démissionnaires définitifs</li>
+<li>Export transfert final</li>
+<li>Rouvrir l'app → tout est là</li>
+</ol>
+
+<h2>Phase 5 — Robustesse (P2, quand le métier est OK)</h2>
+<ul class="checklist">
+<li>Fermer l'app au milieu d'une saisie de notes → pas de corruption à la réouverture</li>
+<li>Gros import (tous les étudiants + toutes les maquettes) : temps acceptable, pas de freeze prolongé</li>
+<li>Caractères spéciaux : noms avec accents, apostrophes, e-mails</li>
+<li>Millésime sans maquette M2 → message d'erreur clair au passage M2</li>
+<li>Onglet vide (pas d'import EdT) → message utile, pas d'écran blanc</li>
+<li><strong>Tout actualiser</strong> après gros import → listes à jour partout</li>
+</ul>
+
+<h2>Phase 6 — Windows (plus tard, liste courte)</h2>
+<p><em>À ne faire qu'après que les P0 Mac soient verts :</em></p>
+<ul class="checklist">
+<li>Build <code>scripts/build_windows.ps1</code> sur une machine Windows</li>
+<li>Double-clic <code>MNEGradeManager.exe</code> → accueil</li>
+<li>Export zip sur Mac → Import sur Windows (ou l'inverse)</li>
+<li>Chemins <code>C:\Users\...\.mne_grade_manager\</code></li>
+<li>Outlook / client mail par défaut pour convocations</li>
+<li>Affichage écran 1366×768 ou petit laptop</li>
+</ul>
+
+<h2>Grille de priorisation</h2>
+<table>
+<tr><th>Priorité</th><th>Signification</th><th>Exemples</th></tr>
+<tr><td><strong>P0</strong></td><td>Bloquant pour les collègues</td><td>Import étudiants/maquettes, notes, jury, export/import zip</td></tr>
+<tr><td><strong>P1</strong></td><td>Important mais contournable</td><td>Statistiques, convocations, EdT M2 été vide</td></tr>
+<tr><td><strong>P2</strong></td><td>Confort / polish</td><td>Perf, edge cases, PDF mineurs</td></tr>
+</table>
+<p><strong>Règle :</strong> pas de nouvelle fonctionnalité tant qu'un <strong>P0</strong> du même domaine est rouge.</p>
+
+<h2>Journal de test</h2>
+<p>Pour chaque test, notez en une ligne :</p>
+<p class="example">[OK/KO] — test — fichier ou millésime — commentaire</p>
+<p>Exemple :</p>
+<p class="example" style="color:#800000;">[KO] Import maquette M2 NFC — OF_PR1163_2026.xlsx — UE manquante ligne 42</p>
+
+<p class="footer">Document généré pour MNE Grade Manager V3 — checklist de convergence avant déploiement collègues.</p>
+
+</body>
+</html>

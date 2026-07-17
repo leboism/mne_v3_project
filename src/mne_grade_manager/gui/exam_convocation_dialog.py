@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.mne_modules import course_ue_code, lookup_mne_module, normalize_mne_module_code
+from ..services.contact_emails import primary_email
 from ..services.exam_convocation import (
     ConvocationParams,
     build_convocation_email,
@@ -76,6 +77,11 @@ class ExamConvocationDialog(QDialog):
         self.year_combo.setMinimumWidth(200)
         self.year_combo.currentIndexChanged.connect(self._on_scope_changed)
         form.addRow("Academic year :", self.year_combo)
+
+        self.course_search = QLineEdit()
+        self.course_search.setPlaceholderText("Search course / module… (code, MNE, title)")
+        self.course_search.textChanged.connect(self._apply_course_filter)
+        form.addRow("Search :", self.course_search)
 
         self.course_combo = QComboBox()
         self.course_combo.setMinimumWidth(360)
@@ -181,6 +187,7 @@ class ExamConvocationDialog(QDialog):
 
         self._emails_block = ""
         self._recipient_emails: list[str] = []
+        self._all_courses: list[dict[str, Any]] = []
         self._populate_years()
         self._populate_courses()
         if course_id is not None:
@@ -216,14 +223,47 @@ class ExamConvocationDialog(QDialog):
     def _populate_courses(self) -> None:
         self.course_combo.blockSignals(True)
         self.course_combo.clear()
-        for c in self.repo.list_courses():
+        self._all_courses = list(self.repo.list_courses())
+        self._fill_course_combo(self._all_courses)
+        self.course_combo.blockSignals(False)
+
+    def _fill_course_combo(self, courses: list[dict[str, Any]]) -> None:
+        self.course_combo.clear()
+        for c in courses:
             cid = int(c["id"])
             mne = course_ue_code(c)
             code = str(c.get("code") or "")
             name = str(c.get("name") or "")
             head = f"{mne} — {name}" if mne else f"{code} — {name}"
             self.course_combo.addItem(head, cid)
+
+    def _apply_course_filter(self) -> None:
+        q = (self.course_search.text() or "").strip().lower()
+        prev = self.course_combo.currentData()
+        if not q:
+            filtered = self._all_courses
+        else:
+            filtered = []
+            for c in self._all_courses:
+                bits = [
+                    str(c.get("code") or ""),
+                    str(course_ue_code(c) or ""),
+                    str(c.get("name") or ""),
+                ]
+                hay = " ".join(bits).lower()
+                if q in hay:
+                    filtered.append(c)
+        self.course_combo.blockSignals(True)
+        self._fill_course_combo(filtered)
+        if prev is not None:
+            i = self.course_combo.findData(prev)
+            if i >= 0:
+                self.course_combo.setCurrentIndex(i)
+        if self.course_combo.count() == 0:
+            self.templates_info.setText("No course matches this filter.")
+            self.student_count_label.setText("—")
         self.course_combo.blockSignals(False)
+        self._on_scope_changed()
 
     def _selected_year(self) -> str:
         return str(self.year_combo.currentData() or "").strip()
@@ -346,7 +386,7 @@ class ExamConvocationDialog(QDialog):
             session=int(self.session_spin.value()),
             extra_notes=self.extra_notes.toPlainText().strip(),
             teacher_name=teacher,
-            teacher_email=str(course.get("teacher_email") or "").strip(),
+            teacher_email=primary_email(course, prefix="teacher"),
             apogee_code=str(course.get("code") or ""),
             curricula_summary=curricula,
         )

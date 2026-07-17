@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -23,25 +24,32 @@ from ..gui.internship_dialog import InternshipDialog
 from ..core.institutions import INTERNSHIP_STATUS_CHOICES
 from ..gui.widgets import fill_table, make_actions_toolbar
 from ..services.grade_status import format_grade_display, parse_grade_cell
+from ..services.timetable_legacy import course_public_code
 
 
 class GradesTab(QWidget):
-    def __init__(self, repo, refresh_callbacks=None):
+    def __init__(self, repo, refresh_callbacks=None, *, default_academic_year: str = ""):
         super().__init__()
         self.repo = repo
         self.refresh_callbacks = refresh_callbacks or []
+        self.default_academic_year = (default_academic_year or "").strip()
         self.template_ids: list[int] = []
         self.student_ids: list[int] = []
         self.course_ids: list[int] = []
+        self._loading_table = False
+        self._dirty = False
+        self._prev_template_index = -1
+        self._prev_student_index = -1
+        self._prev_course_index = -1
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.template_combo = QComboBox()
         self.student_combo = QComboBox()
         self.course_combo = QComboBox()
-        self.template_combo.currentIndexChanged.connect(self._template_changed)
-        self.student_combo.currentIndexChanged.connect(self.refresh_assessment_table)
-        self.course_combo.currentIndexChanged.connect(self.refresh_assessment_table)
+        self.template_combo.currentIndexChanged.connect(self._on_template_combo_changed)
+        self.student_combo.currentIndexChanged.connect(self._on_student_combo_changed)
+        self.course_combo.currentIndexChanged.connect(self._on_course_combo_changed)
         form.addRow("Maquette", self.template_combo)
         form.addRow("Étudiant", self.student_combo)
         form.addRow("UE", self.course_combo)
@@ -60,6 +68,9 @@ class GradesTab(QWidget):
         )
         layout.addLayout(grades_tb.layout)
         self.internship_action = grades_tb.menu_actions["Dossier stage (raccourci)…"]
+        save_btn = grades_tb.primary_buttons[0] if grades_tb.primary_buttons else None
+        if save_btn is not None:
+            save_btn.setToolTip("Enregistrer les modifications (Ctrl+S)")
 
         self.info_label = QLabel(
             "Sélectionnez une maquette, un étudiant et une UE. "
@@ -93,9 +104,17 @@ class GradesTab(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self.table.installEventFilter(self)
+        self.table.itemChanged.connect(self._on_table_item_changed)
         layout.addWidget(self.table)
 
+        self._install_shortcuts()
         self.refresh()
+
+    def _install_shortcuts(self) -> None:
+        save_act = QAction(self)
+        save_act.setShortcut(QKeySequence.Save)
+        save_act.triggered.connect(self.save_grades)
+        self.addAction(save_act)
 
     def eventFilter(self, obj, event):  # noqa: ANN001
         if obj is self.table and event.type() == QEvent.Type.KeyPress:
@@ -103,6 +122,99 @@ class GradesTab(QWidget):
                 if self._clear_selected_note_cells():
                     return True
         return super().eventFilter(obj, event)
+
+    def _mark_dirty(self, dirty: bool = True) -> None:
+        self._dirty = bool(dirty)
+        base = self.info_label.text().split("  |  ")[0].strip()
+        if self._dirty:
+            if "modifications non enregistrées" not in self.info_label.text().lower():
+                self.info_label.setText(f"{base}  |  ⚠ Modifications non enregistrées (Ctrl+S)")
+        else:
+            self.info_label.setText(base)
+
+    def _confirm_discard_or_save(self, *, title: str) -> str:
+        """
+        Retourne 'save' | 'discard' | 'cancel'.
+        """
+        if not self._dirty:
+            return "discard"
+        msg = QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setText("Des modifications n’ont pas été enregistrées.")
+        msg.setInformativeText("Voulez-vous enregistrer avant de changer de sélection ?")
+        save_btn = msg.addButton("Enregistrer", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = msg.addButton("Ignorer", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = msg.addButton("Annuler", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(save_btn)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked is save_btn:
+            self.save_grades()
+            return "discard" if not self._dirty else "cancel"
+        if clicked is discard_btn:
+            self._mark_dirty(False)
+            return "discard"
+        if clicked is cancel_btn:
+            return "cancel"
+        return "cancel"
+
+    def _on_template_combo_changed(self, idx: int) -> None:
+        if self._prev_template_index < 0:
+            self._prev_template_index = idx
+            self._template_changed()
+            return
+        decision = self._confirm_discard_or_save(title="Changer de maquette")
+        if decision == "cancel":
+            self.template_combo.blockSignals(True)
+            self.template_combo.setCurrentIndex(self._prev_template_index)
+            self.template_combo.blockSignals(False)
+            return
+        self._prev_template_index = idx
+        self._template_changed()
+
+    def _on_student_combo_changed(self, idx: int) -> None:
+        if self._prev_student_index < 0:
+            self._prev_student_index = idx
+            template_id = self.template_combo.currentData()
+            if template_id is not None:
+                self._refresh_course_combo(int(template_id), self.course_combo.currentData(), None)
+            self.refresh_assessment_table()
+            return
+        decision = self._confirm_discard_or_save(title="Changer d’étudiant")
+        if decision == "cancel":
+            self.student_combo.blockSignals(True)
+            self.student_combo.setCurrentIndex(self._prev_student_index)
+            self.student_combo.blockSignals(False)
+            return
+        self._prev_student_index = idx
+        template_id = self.template_combo.currentData()
+        if template_id is not None:
+            self._refresh_course_combo(int(template_id), self.course_combo.currentData(), None)
+        self.refresh_assessment_table()
+
+    def _on_course_combo_changed(self, idx: int) -> None:
+        if self._prev_course_index < 0:
+            self._prev_course_index = idx
+            self.refresh_assessment_table()
+            return
+        decision = self._confirm_discard_or_save(title="Changer d’UE")
+        if decision == "cancel":
+            self.course_combo.blockSignals(True)
+            self.course_combo.setCurrentIndex(self._prev_course_index)
+            self.course_combo.blockSignals(False)
+            return
+        self._prev_course_index = idx
+        self.refresh_assessment_table()
+
+    def _on_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._loading_table:
+            return
+        if item is None:
+            return
+        # Colonnes éditables : Note (5), Garder (6) et Commentaire (7)
+        if item.column() in (5, 6, 7):
+            self._mark_dirty(True)
 
     def _clear_selected_note_cells(self) -> bool:
         """Vide la colonne Note (5) pour les cellules sélectionnées, sauf si « Garder » est coché."""
@@ -123,10 +235,16 @@ class GradesTab(QWidget):
                 continue
             it.setText("")
             done = True
+        if done:
+            self._mark_dirty(True)
         return done
 
     def refresh(self) -> None:
-        templates = self.repo.list_templates()
+        try:
+            self.repo.repair_internship_assessments()
+        except Exception:
+            pass
+        templates = self.repo.list_templates(academic_year=self.default_academic_year or None)
         self.template_ids = [t["id"] for t in templates]
         self.template_combo.clear()
         for t in templates:
@@ -152,28 +270,47 @@ class GradesTab(QWidget):
             fill_table(self.table, [], [])
             return
         students = self.repo.list_students_for_template(int(template_id))
-        courses = self.repo.list_template_courses(int(template_id))
         self.student_ids = [s["id"] for s in students]
-        self.course_ids = [c["course_id"] for c in courses]
         from ..services.lookups import student_combo_label
 
         for s in students:
             self.student_combo.addItem(student_combo_label(s), s["id"])
-        for c in courses:
-            self.course_combo.addItem(f"{c['code']} - {c['name']}", c["course_id"])
 
         if prev_student_id is not None:
             idx = self.student_combo.findData(prev_student_id)
             if idx >= 0:
                 self.student_combo.setCurrentIndex(idx)
+
+        self.student_combo.blockSignals(False)
+        self._refresh_course_combo(int(template_id), prev_course_id, prev_student_id)
+        self.refresh_assessment_table()
+
+    def _refresh_course_combo(
+        self, template_id: int, prev_course_id: Any, prev_student_id: Any
+    ) -> None:
+        student_id = self.student_combo.currentData() or prev_student_id
+        if student_id is not None:
+            courses = self.repo.list_template_courses_for_student(
+                int(student_id), int(template_id)
+            )
+        else:
+            courses = self.repo.list_template_courses(int(template_id))
+        tpl = next(
+            (t for t in self.repo.list_templates() if int(t["id"]) == int(template_id)),
+            None,
+        ) or {}
+        tpl_ay = str(tpl.get("academic_year") or self.default_academic_year or "").strip()
+        self.course_combo.blockSignals(True)
+        self.course_combo.clear()
+        self.course_ids = [c["course_id"] for c in courses]
+        for c in courses:
+            pub = course_public_code(c, academic_year=tpl_ay)
+            self.course_combo.addItem(f"{pub} - {c['name']}", c["course_id"])
         if prev_course_id is not None:
             cidx = self.course_combo.findData(prev_course_id)
             if cidx >= 0:
                 self.course_combo.setCurrentIndex(cidx)
-
-        self.student_combo.blockSignals(False)
         self.course_combo.blockSignals(False)
-        self.refresh_assessment_table()
 
     def manage_enrollments(self) -> None:
         template_id = self.template_combo.currentData()
@@ -206,6 +343,7 @@ class GradesTab(QWidget):
             )
             for cb in self.refresh_callbacks:
                 cb()
+            self._mark_dirty(False)
         except Exception as exc:
             QMessageBox.critical(self, "Validation UE", str(exc))
             self.refresh_assessment_table()
@@ -218,6 +356,7 @@ class GradesTab(QWidget):
             self.ue_validated_row.hide()
             fill_table(self.table, [], [])
             return
+        self._loading_table = True
         self.ue_validated_row.setVisible(template_id is not None)
         if template_id is not None:
             validated = self.repo.has_ue_ects_validation(
@@ -227,10 +366,20 @@ class GradesTab(QWidget):
             self.ects_validated_cb.setChecked(validated)
             self.ects_validated_cb.blockSignals(False)
             self.table.setEnabled(not validated)
-        if template_id is not None and self.repo.is_sent_to_second_session(
-            int(student_id), int(template_id), int(course_id)
-        ):
-            self.repo.carry_over_reprise_grades_from_session1(int(student_id), int(course_id))
+        if template_id is not None:
+            if not self.repo.is_sent_to_second_session(
+                int(student_id), int(template_id), int(course_id)
+            ):
+                self.repo.purge_carried_s2_reprises_without_send(
+                    int(student_id), int(course_id), template_id=int(template_id)
+                )
+        if self.repo.is_internship_course(int(course_id)):
+            try:
+                from ..services.internship_grades import ensure_internship_mcc_and_assessments
+
+                ensure_internship_mcc_and_assessments(self.repo, int(course_id))
+            except Exception:
+                pass
         rows = self.repo.get_grades_for_student_course(int(student_id), int(course_id))
         headers = ["ID éval.", "Nom", "Type", "Coef", "Session", "Note", "Garder", "Commentaire"]
         self.table.setColumnCount(len(headers))
@@ -250,6 +399,8 @@ class GradesTab(QWidget):
                         row["grade"],
                         row.get("status"),
                         assessment_session=int(row.get("session") or 1),
+                        assessment_kind=str(row.get("kind") or ""),
+                        assessment_name=str(row.get("name") or ""),
                     )
                 ),
             )
@@ -273,6 +424,11 @@ class GradesTab(QWidget):
             msg = "Moyenne UE : —" if avg is None else f"Moyenne UE : {avg:.3f}/20"
         is_stage = self.repo.is_internship_course(int(course_id))
         self.internship_action.setVisible(is_stage)
+        if is_stage:
+            msg += (
+                "  |  Stage : encadrant 50 %, rapport 25 %, soutenance 25 % "
+                "(ou cochez « UE validée sans note »)."
+            )
         if is_stage and template_id is not None:
             rec = self.repo.get_internship_record(
                 int(student_id), int(template_id), int(course_id)
@@ -285,6 +441,8 @@ class GradesTab(QWidget):
                 )
                 msg += f"  |  Stage : {st_lab}"
         self.info_label.setText(msg)
+        self._mark_dirty(False)
+        self._loading_table = False
 
     def save_grades(self) -> None:
         student_id = self.student_combo.currentData()
@@ -327,6 +485,7 @@ class GradesTab(QWidget):
             self.refresh_assessment_table()
             for cb in self.refresh_callbacks:
                 cb()
+            self._mark_dirty(False)
         except Exception as exc:
             QMessageBox.critical(self, "Error", str(exc))
 

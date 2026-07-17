@@ -50,7 +50,8 @@ class JuryRosterPickDialog(QDialog):
 
         lay = QVBoxLayout(self)
         hint = QLabel(
-            "Compositions enregistrées sur les autres parcours du même millésime / niveau."
+            "Compositions enregistrées sur les parcours du même niveau (M1 ou M2), "
+            "tous millésimes confondus — le millésime est indiqué à droite de chaque ligne."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: palette(mid); font-size: 11px;")

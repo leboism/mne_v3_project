@@ -5,11 +5,13 @@ from __future__ import annotations
 OTHER_CARRIER_DATA = "__OTHER_CARRIER__"
 
 MNE_CARRIER_PARTNERS: tuple[tuple[str, str], ...] = (
-    ("CEA/INSTN", "CEA/INSTN"),
-    ("UFR Sciences UPSay", "UFR Sciences UPSay"),
-    ("ENSTA", "ENSTA"),
-    ("ChimieParisTech", "ChimieParisTech"),
-    ("Mines-Ponts ParisTech", "Mines-Ponts ParisTech"),
+    ("Université Paris-Saclay", "Université Paris-Saclay"),
+    ("ENSTA Paris", "ENSTA Paris"),
+    ("Chimie ParisTech-PSL", "Chimie ParisTech-PSL"),
+    ("CentraleSupélec", "CentraleSupélec"),
+    ("CEA / INSTN", "CEA / INSTN"),
+    ("École des Ponts ParisTech", "École des Ponts ParisTech"),
+    ("Institut Polytechnique de Paris", "Institut Polytechnique de Paris"),
     ("Autre", OTHER_CARRIER_DATA),
 )
 

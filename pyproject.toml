@@ -11,6 +11,7 @@ dependencies = [
     "reportlab>=4.0",
     "opencv-python-headless>=4.13.0.92",
     "Pillow>=12.2.0",
+    "python-docx>=1.2.0",
 ]
 
 [project.scripts]
@@ -25,3 +26,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"mne_grade_manager" = ["assets/**/*", "core/schema.sql"]

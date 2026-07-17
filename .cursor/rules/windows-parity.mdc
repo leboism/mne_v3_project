@@ -1,0 +1,8 @@
+---
+description: Garder les versions macOS et Windows alignées
+alwaysApply: true
+---
+
+Lors de toute correction ou évolution sur macOS, appliquer les changements dans le code source partagé (`src/mne_grade_manager/`) de façon compatible Windows (PySide6, pathlib, pas d’API spécifique macOS sauf garde `sys.platform`).
+
+La version Windows est recompilée périodiquement via `scripts/build_windows.bat` / PyInstaller : ne pas maintenir de correctifs séparés côté Windows ; vérifier que les changements UI restent cross-platform (`gui/platform.py` pour les réglages spécifiques si besoin).

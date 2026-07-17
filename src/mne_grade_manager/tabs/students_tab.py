@@ -28,7 +28,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core.parcours import PARCOURS_BY_LEVEL, track_label
+from ..core.master_team import MNE_ENROLLMENT_INSTITUTIONS
+from ..core.parcours import PARCOURS_BY_LEVEL, track_display_label
+from ..services.student_mobility import is_erasmus_student
 from ..gui.admission_import_dialog import AdmissionImportDialog, import_admission_dossiers
 from ..gui.dialogs import StudentDialog
 from ..gui.progression_dialog import StudentProgressionDialog
@@ -41,9 +43,11 @@ from ..services.student_excel import (
     STUDENT_REQUIRED_IMPORT_KEYS,
     build_import_column_map,
     field_label_fr,
+    normalize_mon_master_ranking,
     write_student_import_template,
     write_students_workbook,
 )
+from ..services.student_funding import encode_funding_codes, parse_funding_codes
 from ..services.lookups import (
     gender_label_fr,
     is_valid_institutional_email,
@@ -53,12 +57,20 @@ from ..services.lookups import (
     normalize_level,
     normalize_track_acronym,
 )
+from ..services.student_status import (
+    STUDENT_STATUS_GRADUATED,
+    STUDENT_STATUS_WITHDRAWN,
+    is_student_active,
+    normalize_student_status,
+)
+
+
+_ENROLLMENT_FILTER_EMPTY = "__EMPTY_ENROLLMENT__"
 
 
 class StudentsTab(QWidget):
     _TABLE_HEADERS = [
         "N° I.N.E.",
-        "N° établ.",
         "Nom",
         "Prénom",
         "Niveau",
@@ -69,6 +81,10 @@ class StudentsTab(QWidget):
     ]
     _ALARM_BG = QColor(255, 235, 238)
     _ALARM_FG = QColor(183, 28, 28)
+    _WITHDRAWN_BG = QColor(245, 245, 245)
+    _WITHDRAWN_FG = QColor(120, 120, 120)
+    _GRADUATED_BG = QColor(232, 245, 233)
+    _GRADUATED_FG = QColor(27, 94, 32)
 
     def __init__(self, repo, refresh_callbacks=None, default_academic_year: str = ""):
         super().__init__()
@@ -88,14 +104,24 @@ class StudentsTab(QWidget):
         self.profile_btn.clicked.connect(self.open_profile)
         self.edit_btn = QPushButton("Modifier…")
         self.edit_btn.clicked.connect(self.edit_student)
+        self.withdraw_btn = QPushButton("Démissionnaire")
+        self.withdraw_btn.setToolTip(
+            "Retire l'étudiant de la liste active (notes, convocations, statistiques…) "
+            "sans supprimer sa fiche ni son dossier de candidature."
+        )
+        self.withdraw_btn.clicked.connect(self._toggle_withdrawn_selection)
         toolbar.addWidget(self.add_btn)
         toolbar.addWidget(self.profile_btn)
         toolbar.addWidget(self.edit_btn)
+        toolbar.addWidget(self.withdraw_btn)
 
         self.more_btn = QToolButton()
         self.more_btn.setText("Actions")
         self.more_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         more_menu = QMenu(self)
+        more_menu.addAction("Marquer démissionnaire", self.mark_selected_withdrawn)
+        more_menu.addAction("Réintégrer (liste active)", self.restore_selected_active)
+        more_menu.addSeparator()
         more_menu.addAction("Supprimer la sélection", self.delete_selected_students)
         more_menu.addSeparator()
         more_menu.addAction("Importer Excel…", self.import_excel)
@@ -103,9 +129,13 @@ class StudentsTab(QWidget):
         more_menu.addAction("Modèle d'import Excel…", self.generate_import_template)
         more_menu.addAction("Exporter Excel…", self.export_excel)
         more_menu.addSeparator()
-        more_menu.addAction("Liste d'e-mails…", self.open_email_list)
+        more_menu.addAction("Mailing liste (e-mail)…", self.open_email_list)
         more_menu.addSeparator()
         more_menu.addAction("Passage M2 / redoublement…", self.open_progression)
+        more_menu.addAction(
+            "Réinitialiser contrats pédagogiques M2 (passages antérieurs)…",
+            self.reset_m2_pedagogical_contracts_batch,
+        )
         self.more_btn.setMenu(more_menu)
         toolbar.addWidget(self.more_btn)
         toolbar.addStretch()
@@ -133,7 +163,7 @@ class StudentsTab(QWidget):
 
         filters.addWidget(QLabel("Recherche :"), 1, 2)
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Nom, I.N.E., n° inscription, e-mail…")
+        self.search_edit.setPlaceholderText("Nom, I.N.E., e-mail…")
         self.search_edit.textChanged.connect(self._rebuild_table)
         filters.addWidget(self.search_edit, 1, 3)
 
@@ -143,7 +173,30 @@ class StudentsTab(QWidget):
         self.filter_contract.addItem("⚠ Manquant (obligatoire)", "missing")
         self.filter_contract.addItem("Présent", "ok")
         self.filter_contract.currentIndexChanged.connect(self._rebuild_table)
-        filters.addWidget(self.filter_contract, 2, 1, 1, 3)
+        filters.addWidget(self.filter_contract, 2, 1)
+
+        filters.addWidget(QLabel("Profil :"), 2, 2)
+        self.filter_mobility = QComboBox()
+        self.filter_mobility.addItem("Tous", "")
+        self.filter_mobility.addItem("MNE (parcours complet)", "mne")
+        self.filter_mobility.addItem("ERASMUS / mobilité", "erasmus")
+        self.filter_mobility.currentIndexChanged.connect(self._rebuild_table)
+        filters.addWidget(self.filter_mobility, 2, 3)
+
+        filters.addWidget(QLabel("Affichage :"), 3, 0)
+        self.filter_status = QComboBox()
+        self.filter_status.addItem("Actifs", "active")
+        self.filter_status.addItem("Diplômés", "graduated")
+        self.filter_status.addItem("Démissionnaires", "withdrawn")
+        self.filter_status.addItem("Tous", "all")
+        self.filter_status.currentIndexChanged.connect(self._on_filter_status_changed)
+        filters.addWidget(self.filter_status, 3, 1)
+
+        filters.addWidget(QLabel("Établ. d'inscription :"), 3, 2)
+        self.filter_enrollment = QComboBox()
+        self.filter_enrollment.addItem("Tous", "")
+        self.filter_enrollment.currentIndexChanged.connect(self._rebuild_table)
+        filters.addWidget(self.filter_enrollment, 3, 3)
 
         sort_row = QHBoxLayout()
         sort_row.addWidget(QLabel("Tri :"))
@@ -164,7 +217,8 @@ class StudentsTab(QWidget):
 
         hint = QLabel(
             "Double-cliquez sur une ligne pour ouvrir la fiche étudiant. "
-            "Le numéro MNE est généré à partir de l'identité (ex. MNE-DUPONT-JE-A7K2) — non demandé à l'import Excel."
+            "« Démissionnaire » : masque l'étudiant des listes actives (notes, convocations…) "
+            "tout en conservant sa fiche et son dossier."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: palette(mid); font-size: 11px;")
@@ -176,7 +230,84 @@ class StudentsTab(QWidget):
         self.table.doubleClicked.connect(self._on_double_click)
         layout.addWidget(self.table, 1)
         self._rebuild_track_filter()
+        self._on_filter_status_changed()
         self.refresh()
+
+    def _toggle_withdrawn_selection(self) -> None:
+        mode = str(self.filter_status.currentData() or "active")
+        if mode == "withdrawn":
+            self.restore_selected_active()
+        else:
+            self.mark_selected_withdrawn()
+
+    def mark_selected_withdrawn(self) -> None:
+        ids = self._selected_student_ids()
+        if not ids:
+            QMessageBox.information(
+                self,
+                "Démissionnaire",
+                "Sélectionnez un ou plusieurs étudiants dans la liste.",
+            )
+            return
+        active_ids = [
+            sid
+            for sid in ids
+            if is_student_active(self.repo.get_student(sid) or {})
+        ]
+        if not active_ids:
+            QMessageBox.information(
+                self,
+                "Démissionnaire",
+                "Les étudiants sélectionnés sont déjà marqués démissionnaires.",
+            )
+            return
+        reply = QMessageBox.question(
+            self,
+            "Marquer démissionnaire",
+            f"Marquer {len(active_ids)} étudiant(s) comme démissionnaire(s) ?\n\n"
+            "Ils disparaîtront des listes actives (notes, convocations, statistiques…) "
+            "mais leur fiche et leur dossier seront conservés.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self.repo.mark_students_withdrawn(active_ids)
+            self.refresh()
+            for cb in self.refresh_callbacks:
+                cb()
+        except Exception as exc:
+            QMessageBox.critical(self, "Erreur", str(exc))
+
+    def restore_selected_active(self) -> None:
+        ids = self._selected_student_ids()
+        if not ids:
+            QMessageBox.information(
+                self,
+                "Réintégrer",
+                "Sélectionnez un ou plusieurs étudiants dans la liste.",
+            )
+            return
+        withdrawn_ids = [
+            sid
+            for sid in ids
+            if not is_student_active(self.repo.get_student(sid) or {})
+        ]
+        if not withdrawn_ids:
+            QMessageBox.information(
+                self,
+                "Réintégrer",
+                "Les étudiants sélectionnés sont déjà actifs.",
+            )
+            return
+        try:
+            self.repo.restore_students_active(withdrawn_ids)
+            self.refresh()
+            for cb in self.refresh_callbacks:
+                cb()
+        except Exception as exc:
+            QMessageBox.critical(self, "Erreur", str(exc))
 
     def _on_filter_level_changed(self) -> None:
         self._rebuild_track_filter()
@@ -189,26 +320,77 @@ class StudentsTab(QWidget):
         self.filter_track.clear()
         self.filter_track.addItem("Tous", "")
         if level in PARCOURS_BY_LEVEL:
-            for code, lab in PARCOURS_BY_LEVEL[level]:
-                self.filter_track.addItem(f"{lab} ({code})", code)
+            for code, _lab in PARCOURS_BY_LEVEL[level]:
+                self.filter_track.addItem(track_display_label(level, code), code)
         else:
             seen: set[str] = set()
-            for lv_tracks in PARCOURS_BY_LEVEL.values():
-                for code, lab in lv_tracks:
+            for lv, lv_tracks in PARCOURS_BY_LEVEL.items():
+                for code, _lab in lv_tracks:
                     if code not in seen:
                         seen.add(code)
-                        self.filter_track.addItem(f"{lab} ({code})", code)
+                        self.filter_track.addItem(track_display_label(lv, code), code)
         if prev:
             idx = self.filter_track.findData(prev)
             if idx >= 0:
                 self.filter_track.setCurrentIndex(idx)
         self.filter_track.blockSignals(False)
 
+    def _on_filter_status_changed(self) -> None:
+        mode = str(self.filter_status.currentData() or "active")
+        if mode == "withdrawn":
+            self.withdraw_btn.setText("Réintégrer")
+            self.withdraw_btn.setToolTip(
+                "Remet l'étudiant dans la liste active (notes, convocations, inscriptions…)."
+            )
+        else:
+            self.withdraw_btn.setText("Démissionnaire")
+            self.withdraw_btn.setToolTip(
+                "Retire l'étudiant de la liste active sans supprimer sa fiche."
+            )
+        self._rebuild_table()
+
     def refresh(self) -> None:
-        self._students_raw = self.repo.list_students()
+        try:
+            from ..services.student_parcours_repair import repair_student_parcours
+
+            repair_student_parcours(self.repo.db)
+        except Exception:
+            pass
+        self._students_raw = self.repo.list_students(include_withdrawn=True)
         self._missing_contract_ids = self.repo.student_ids_missing_pedagogical_contract()
         self._populate_year_filter()
+        self._populate_enrollment_filter()
         self._rebuild_table()
+
+    def _populate_enrollment_filter(self) -> None:
+        from_db = {
+            str(s.get("enrollment_institution") or "").strip()
+            for s in self._students_raw
+            if str(s.get("enrollment_institution") or "").strip()
+        }
+        known = set(MNE_ENROLLMENT_INSTITUTIONS)
+        extra = sorted(from_db - known, key=str.casefold)
+        has_empty = any(not str(s.get("enrollment_institution") or "").strip() for s in self._students_raw)
+
+        prev = self.filter_enrollment.currentData()
+        self.filter_enrollment.blockSignals(True)
+        self.filter_enrollment.clear()
+        self.filter_enrollment.addItem("Tous", "")
+        for inst in MNE_ENROLLMENT_INSTITUTIONS:
+            self.filter_enrollment.addItem(inst, inst)
+        for inst in extra:
+            self.filter_enrollment.addItem(inst, inst)
+        if has_empty:
+            self.filter_enrollment.addItem("(non renseigné)", _ENROLLMENT_FILTER_EMPTY)
+        if prev is not None:
+            idx = self.filter_enrollment.findData(prev)
+            if idx >= 0:
+                self.filter_enrollment.setCurrentIndex(idx)
+            else:
+                self.filter_enrollment.setCurrentIndex(0)
+        else:
+            self.filter_enrollment.setCurrentIndex(0)
+        self.filter_enrollment.blockSignals(False)
 
     def _populate_year_filter(self) -> None:
         years = sorted(
@@ -225,19 +407,28 @@ class StudentsTab(QWidget):
             idx = self.filter_year.findData(prev)
             if idx >= 0:
                 self.filter_year.setCurrentIndex(idx)
+            elif self.default_academic_year:
+                idx = self.filter_year.findData(self.default_academic_year)
+                if idx < 0:
+                    self.filter_year.addItem(self.default_academic_year, self.default_academic_year)
+                    idx = self.filter_year.findData(self.default_academic_year)
+                if idx >= 0:
+                    self.filter_year.setCurrentIndex(idx)
             elif years:
                 self.filter_year.setCurrentIndex(1)
             else:
                 self.filter_year.setCurrentIndex(0)
-        elif self.default_academic_year and self.default_academic_year in years:
+        elif self.default_academic_year:
             idx = self.filter_year.findData(self.default_academic_year)
+            if idx < 0:
+                self.filter_year.addItem(self.default_academic_year, self.default_academic_year)
+                idx = self.filter_year.findData(self.default_academic_year)
             if idx >= 0:
                 self.filter_year.setCurrentIndex(idx)
+            else:
+                self.filter_year.setCurrentIndex(0)
         elif years:
             self.filter_year.setCurrentIndex(1)
-        elif self.default_academic_year:
-            self.filter_year.addItem(self.default_academic_year, self.default_academic_year)
-            self.filter_year.setCurrentIndex(self.filter_year.count() - 1)
         else:
             self.filter_year.setCurrentIndex(0)
         self.filter_year.blockSignals(False)
@@ -345,6 +536,38 @@ class StudentsTab(QWidget):
         elif contract_f == "ok":
             data = [s for s in data if int(s["id"]) not in self._missing_contract_ids]
 
+        mobility_f = str(self.filter_mobility.currentData() or "")
+        if mobility_f == "erasmus":
+            data = [s for s in data if is_erasmus_student(s)]
+        elif mobility_f == "mne":
+            data = [s for s in data if not is_erasmus_student(s)]
+
+        status_f = str(self.filter_status.currentData() or "active")
+        if status_f == "active":
+            data = [s for s in data if is_student_active(s)]
+        elif status_f == "withdrawn":
+            data = [
+                s
+                for s in data
+                if normalize_student_status(s.get("status")) == STUDENT_STATUS_WITHDRAWN
+            ]
+        elif status_f == "graduated":
+            data = [
+                s
+                for s in data
+                if normalize_student_status(s.get("status")) == STUDENT_STATUS_GRADUATED
+            ]
+
+        inst_f = self.filter_enrollment.currentData()
+        if inst_f == _ENROLLMENT_FILTER_EMPTY:
+            data = [s for s in data if not str(s.get("enrollment_institution") or "").strip()]
+        elif inst_f:
+            data = [
+                s
+                for s in data
+                if str(s.get("enrollment_institution") or "").strip() == str(inst_f)
+            ]
+
         sort_key = self.sort_combo.currentData() or "last_name_asc"
 
         def last_name(s: dict[str, Any]) -> str:
@@ -387,13 +610,22 @@ class StudentsTab(QWidget):
         for r, s in enumerate(students):
             sid = int(s["id"])
             missing_contract = sid in self._missing_contract_ids
+            status = normalize_student_status(s.get("status"))
+            withdrawn = status == STUDENT_STATUS_WITHDRAWN
+            graduated = status == STUDENT_STATUS_GRADUATED
             lv = str(s.get("level") or "")
             tr = str(s.get("track") or "")
-            tr_disp = track_label(lv, tr) if tr else ""
-            if tr_disp and tr_disp != tr:
-                tr_disp = f"{tr_disp} ({tr})"
-            elif tr:
-                tr_disp = tr
+            if is_erasmus_student(s):
+                tr_disp = "ERASMUS"
+                n_followed = len(
+                    self.repo.list_student_erasmus_course_ids(
+                        sid, str(s.get("academic_year") or "")
+                    )
+                )
+                if n_followed:
+                    tr_disp = f"ERASMUS ({n_followed} UE)"
+            else:
+                tr_disp = track_display_label(lv, tr)
             if sid in self._missing_contract_ids:
                 contract_txt = "⚠ Manquant"
             else:
@@ -407,7 +639,6 @@ class StudentsTab(QWidget):
                     contract_txt = "PDF"
             vals = [
                 s.get("student_number_ine", ""),
-                s.get("student_number_local", ""),
                 s.get("last_name", ""),
                 s.get("first_name", ""),
                 lv,
@@ -422,10 +653,20 @@ class StudentsTab(QWidget):
                     item.setData(Qt.ItemDataRole.UserRole, sid)
                 if missing_contract:
                     item.setBackground(QBrush(self._ALARM_BG))
-                    if c == 7:
+                    if c == 6:
                         item.setForeground(QBrush(self._ALARM_FG))
                         f = item.font()
                         f.setBold(True)
+                        item.setFont(f)
+                elif graduated:
+                    item.setBackground(QBrush(self._GRADUATED_BG))
+                    item.setForeground(QBrush(self._GRADUATED_FG))
+                elif withdrawn:
+                    item.setBackground(QBrush(self._WITHDRAWN_BG))
+                    item.setForeground(QBrush(self._WITHDRAWN_FG))
+                    if c in (1, 2):
+                        f = item.font()
+                        f.setItalic(True)
                         item.setFont(f)
                 self.table.setItem(r, c, item)
         self.table.resizeColumnsToContents()
@@ -560,6 +801,50 @@ class StudentsTab(QWidget):
             for cb in self.refresh_callbacks:
                 cb()
 
+    def reset_m2_pedagogical_contracts_batch(self) -> None:
+        candidates = self.repo.list_m2_students_with_pedagogical_contract()
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "Contrats pédagogiques M2",
+                "Aucun étudiant en M2 n'a encore de contrat pédagogique enregistré.",
+            )
+            return
+        preview = "\n".join(
+            f"  • {str(s.get('last_name') or '').strip()} {str(s.get('first_name') or '').strip()}".strip()
+            for s in candidates[:15]
+        )
+        extra = ""
+        if len(candidates) > 15:
+            extra = f"\n  … et {len(candidates) - 15} autre(s)"
+        reply = QMessageBox.question(
+            self,
+            "Contrats pédagogiques M2",
+            (
+                f"{len(candidates)} étudiant(s) en M2 ont encore un contrat pédagogique "
+                "(probablement le contrat M1, distinct du contrat M2).\n\n"
+                "Le contrat sera effacé sur chaque fiche (PDF + version papier). "
+                "Un nouveau contrat M2 devra ensuite être déposé.\n\n"
+                f"{preview}{extra}\n\n"
+                "Confirmer la réinitialisation ?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        count, names = self.repo.reset_pedagogical_contracts_for_m2_students()
+        msg = f"{count} contrat(s) pédagogique(s) réinitialisé(s)."
+        if names:
+            lines = "\n".join(f"  • {n}" for n in names[:12])
+            if len(names) > 12:
+                lines += f"\n  … et {len(names) - 12} autre(s)"
+            msg += f"\n\n{lines}"
+        QMessageBox.information(self, "Contrats pédagogiques M2", msg)
+        self.refresh()
+        for cb in self.refresh_callbacks:
+            cb()
+
     def add_student(self) -> None:
         dlg = StudentDialog(self, default_academic_year=self.default_academic_year, repo=self.repo)
         if dlg.exec():
@@ -672,6 +957,7 @@ class StudentsTab(QWidget):
         dossiers = [parse_admission_pdf(p) for p in pdf_files]
         dlg = AdmissionImportDialog(
             dossiers,
+            repo=self.repo,
             default_academic_year=self.default_academic_year,
             parent=self,
         )
@@ -679,16 +965,17 @@ class StudentsTab(QWidget):
             return
 
         selected = dlg.selected_dossiers()
-        created, skipped, errors = import_admission_dossiers(
+        created, updated, skipped, errors = import_admission_dossiers(
             self.repo,
             selected,
             default_academic_year=self.default_academic_year,
+            update_existing=dlg.should_update_existing(),
         )
         self.refresh()
         for cb in self.refresh_callbacks:
             cb()
 
-        msg = f"Importés : {created}\nIgnorés : {skipped}"
+        msg = f"Créés : {created}\nMis à jour : {updated}\nIgnorés : {skipped}"
         if errors:
             preview = "\n".join(errors[:15])
             if len(errors) > 15:
@@ -728,8 +1015,12 @@ class StudentsTab(QWidget):
             col_first_name = col_map.get("first_name")
             col_email_personal = col_map.get("email_personal")
             col_email_institutional = col_map.get("email_institutional")
+            col_phone = col_map.get("phone")
             col_enrollment_institution = col_map.get("enrollment_institution")
             col_application_platform = col_map.get("application_platform")
+            col_mon_master_ranking = col_map.get("mon_master_ranking")
+            col_funding = col_map.get("funding")
+            col_funding_other = col_map.get("funding_other")
             col_accommodations = col_map.get("accommodations")
             col_accommodations_other = col_map.get("accommodations_other")
             col_notes = col_map.get("notes")
@@ -790,7 +1081,13 @@ class StudentsTab(QWidget):
                     enrollment_institution,
                     normalize_email(cell(row, col_email_institutional)),
                 )
+                phone = cell(row, col_phone)
                 application_platform = cell(row, col_application_platform)
+                mon_master_ranking = normalize_mon_master_ranking(
+                    cell_raw(row, col_mon_master_ranking)
+                )
+                funding = encode_funding_codes(parse_funding_codes(cell(row, col_funding)))
+                funding_other = cell(row, col_funding_other)
                 accommodations = cell(row, col_accommodations)
                 accommodations_other = cell(row, col_accommodations_other)
                 notes = cell(row, col_notes)
@@ -858,10 +1155,14 @@ class StudentsTab(QWidget):
                         first_name,
                         email_personal,
                         email_institutional,
+                        phone,
                         enrollment_institution,
                         application_platform,
+                        mon_master_ranking,
                         accommodations,
                         accommodations_other,
+                        funding,
+                        funding_other,
                         notes,
                         level,
                         track,

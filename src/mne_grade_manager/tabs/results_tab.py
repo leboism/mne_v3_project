@@ -19,8 +19,14 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor, QFontMetrics
 
-from ..core.mne_modules import course_ue_code
+from ..services.calculations import grade_meets_minimum, round_grade_mne
+from ..services.timetable_legacy import course_public_code
 from ..gui.widgets import make_actions_toolbar
+from ..services.grade_status import STATUS_ABJ, STATUS_DEF, STATUS_NEUT, STATUS_VAL
+from ..services.results_excel import (
+    suggest_notes_workbook_filename,
+    write_results_notes_workbook,
+)
 
 _NOTE_COL_WIDTH = 76
 _ID_COL_WIDTHS = (88, 100, 100)
@@ -29,7 +35,10 @@ _HEADER_MAX_LINES = 2
 
 
 def _fmt_note(x: float | None) -> str:
-    return "—" if x is None else f"{float(x):.3f}"
+    if x is None:
+        return "—"
+    rounded = round_grade_mne(float(x))
+    return "—" if rounded is None else f"{rounded:.2f}"
 
 
 def _header_usable_width(column_width: int) -> int:
@@ -109,22 +118,23 @@ def _course_header_labels(
     *,
     fm: QFontMetrics,
     column_width: int = _NOTE_COL_WIDTH,
+    academic_year: str = "",
 ) -> tuple[str, str]:
     """Libellé court (1–2 lignes) + infobulle avec l'intitulé complet."""
     name = str(course.get("name") or "").strip()
-    code = str(course.get("code") or "").strip()
-    mne = course_ue_code(course)
+    apogee = str(course.get("code") or "").strip()
+    pub = course_public_code(course, academic_year=academic_year)
     opt = int(course.get("optional") or 0)
     is_free = int(course.get("free_ue") or 0)
     tag = " (opt.)" if opt else (" (libre)" if is_free else "")
 
-    tooltip_parts = [p for p in (mne, name, f"Apogée {code}" if code else "") if p]
+    tooltip_parts = [p for p in (pub, name, f"Apogée {apogee}" if apogee and apogee != pub else "") if p]
     tooltip = "\n".join(tooltip_parts) + (f"\n{tag.strip()}" if tag.strip() else "")
 
-    if mne:
-        display = _mne_code_header_lines(mne, fm=fm, column_width=column_width)
+    if pub:
+        display = _mne_code_header_lines(pub, fm=fm, column_width=column_width)
     else:
-        display = _wrap_header_lines(name or code or "UE", fm=fm, column_width=column_width)
+        display = _wrap_header_lines(name or apogee or "UE", fm=fm, column_width=column_width)
 
     if tag.strip():
         tag_short = "opt." if opt else "libre"
@@ -136,6 +146,9 @@ def _course_header_labels(
             display = f"{display}\n{tag_short}"
 
     return display, tooltip.strip()
+
+
+_COLOR_NEUTRAL = QColor(232, 234, 237)
 
 
 def _color_for_grade_20(v: float | None) -> QColor | None:
@@ -150,13 +163,40 @@ def _color_for_grade_20(v: float | None) -> QColor | None:
     return QColor(255, 205, 210)
 
 
+def _color_for_validation_average(v: float | None) -> QColor | None:
+    """Moyenne année / bloc : vert si ≥ 10, rouge sinon."""
+    if v is None:
+        return None
+    if grade_meets_minimum(v, 10.0):
+        return QColor(198, 239, 206)
+    return QColor(255, 205, 210)
+
+
+def _ue_display_status(row: dict[str, Any], course_id: int) -> str:
+    d = (row.get("ue_detail") or {}).get(course_id) or {}
+    if d.get("ects_validated"):
+        return STATUS_VAL
+    return str(d.get("display") or "").strip().upper()
+
+
+def _color_for_ue_display(display: str) -> QColor | None:
+    """Couleur de fond pour un statut UE non numérique (prioritaire sur la note)."""
+    if display in (STATUS_DEF, STATUS_ABJ):
+        return QColor(255, 205, 210)
+    if display == STATUS_NEUT:
+        return _COLOR_NEUTRAL
+    if display == STATUS_VAL:
+        return QColor(198, 239, 206)
+    return None
+
+
 def _ue_uses_s2(d: dict[str, Any]) -> bool:
     return bool(d.get("use_s2") if "use_s2" in d else d.get("sent_s2"))
 
 
 def _ue_session_numeric(row: dict[str, Any], course_id: int, mode: str) -> float | None:
     d = (row.get("ue_detail") or {}).get(course_id) or {}
-    if mode == "s2":
+    if mode in ("s2", "mixed"):
         base = d.get("s2") if _ue_uses_s2(d) else d.get("s1")
     else:
         base = d.get("s1")
@@ -176,22 +216,21 @@ def _ue_cell_text(row: dict[str, Any], course_id: int, mode: str) -> str:
 
 def _ue_total_numeric(row: dict[str, Any], course_id: int, mode: str) -> float | None:
     d = (row.get("ue_detail") or {}).get(course_id) or {}
-    if mode == "s2":
+    if mode in ("s2", "mixed"):
         base = d.get("s2") if _ue_uses_s2(d) else d.get("s1")
     else:
         base = d.get("s1")
     jp = d.get("jury")
     if base is None:
-        if jp is not None and abs(float(jp)) > 1e-12:
-            return float(jp)
         return None
     return float(base) + float(jp or 0.0)
 
 
 class ResultsTab(QWidget):
-    def __init__(self, repo):
+    def __init__(self, repo, *, default_academic_year: str = ""):
         super().__init__()
         self.repo = repo
+        self.default_academic_year = (default_academic_year or "").strip()
         self.template_ids: list[int] = []
         self._current_template_id: int | None = None
         self._col_metas: list[dict[str, Any] | None] = []
@@ -206,6 +245,8 @@ class ResultsTab(QWidget):
         self.session_combo = QComboBox()
         self.session_combo.addItem("Session 1", "s1")
         self.session_combo.addItem("Session 2", "s2")
+        self.session_combo.addItem("Retenue (S2 si dispo.)", "mixed")
+        self.session_combo.setCurrentIndex(2)
         self.session_combo.currentIndexChanged.connect(self.refresh_table)
         self.student_combo = QComboBox()
         self.student_combo.setMinimumWidth(220)
@@ -220,10 +261,14 @@ class ResultsTab(QWidget):
         layout.addLayout(
             make_actions_toolbar(
                 self,
-                primary=[("Transcript (sélection)…", self._export_transcript_selection)],
+                primary=[
+                    ("Transcripts partiels — tous…", self._export_transcripts_all_retained),
+                    ("Transcript (sélection)…", self._export_transcript_selection),
+                ],
                 menu_sections=[
                     [("Synchroniser les inscriptions", self.compute_and_refresh)],
                     [("Exporter CSV…", self.export_csv)],
+                    [("Exporter Excel (fichier de notes)…", self.export_excel)],
                     [
                         ("Transcripts provisoires (tous)…", self._export_transcripts_all_provisional),
                         ("Transcript provisoire (sélection)…", self._export_transcript_selection),
@@ -237,16 +282,20 @@ class ResultsTab(QWidget):
         )
         self.hint = QLabel(
             "Vue synthétique : notes retenues (session choisie + points de délibération le cas échéant) "
-            "et moyennes de bloc / année. Transcripts PDF : un fichier par étudiant "
-            "(filtre « Tous les étudiants » ou menu « tous ») ; provisoire (session affichée) ou final "
-            "(jury final requis, notes S2 ; mention validée en délibération finale ; "
-            "pas de classement si 2ᵉ session). "
+            "et moyennes de bloc / année. « Retenue (S2 si dispo.) » = état actuel pour transcripts partiels "
+            "(S2 par UE dès qu'une note S2 existe, sinon S1). "
+            "Bouton « Transcripts partiels — tous… » : un PDF par étudiant inscrit avec cette logique. "
+            "Session 2 : uniquement les étudiants avec envoi S2 ou note S2 sur au moins une UE. "
+            "Transcripts finaux : jury final requis, notes S2 ; mention validée en délibération finale ; "
+            "pas de classement si 2ᵉ session ; transcript final : classement parcours et cohorte. "
             "Envois en 2ᵉ session, points de délibération détaillés et PV : "
             "onglet « PV & délibérations ». "
-            "Couleurs : vert > 10, orange 7–10, rouge < 7 ; fond de bloc = validation (moy. > 10, pas de < 7 non gardé). "
-            "Statuts UE : DEF (défaillant), ABJ (absence justifiée), NEUT (neutralisée), "
-            "VAL (validée sans note). « Garder » en saisie = neutralisation d’une épreuve ; "
-            "dérogation seuil 7 = case « Valider (seuil 7) » en délibération interactive. "
+            "Couleurs : vert > 10, orange 7–10, rouge < 7 pour les UE ; "
+            "moyenne année : vert si ≥ 10, rouge sinon ; "
+            "fond de bloc = validé si moy. bloc ≥ 10 et aucune note d'UE < 7 (dérogation seuil 7 possible) ; "
+            "gris si le bloc ne contient que des UE optionnelles. "
+            "Statuts UE : DEF et ABJ (fond rouge), NEUT (gris), VAL (vert) ; "
+            "VAL (validée sans note). Dérogation seuil 7 = note d'UE < 7 validée par le jury. "
             "Cliquez sur l'en-tête d'un bloc (▶/▼) pour afficher ou masquer le détail des UE."
         )
         self.hint.setWordWrap(True)
@@ -319,26 +368,36 @@ class ResultsTab(QWidget):
             bk = str(meta.get("block_name") or "")
             return QBrush(self._color_for_block_row(row, bk, mode))
         if t == "ue_note":
-            v = _ue_session_numeric(row, int(meta["course_id"]), mode)
+            cid = int(meta["course_id"])
+            status_color = _color_for_ue_display(_ue_display_status(row, cid))
+            if status_color:
+                return QBrush(status_color)
+            v = _ue_session_numeric(row, cid, mode)
             c = _color_for_grade_20(v)
             return QBrush(c) if c else None
         if t == "ue_total":
-            v = _ue_total_numeric(row, int(meta["course_id"]), mode)
+            cid = int(meta["course_id"])
+            status_color = _color_for_ue_display(_ue_display_status(row, cid))
+            if status_color:
+                return QBrush(status_color)
+            v = _ue_total_numeric(row, cid, mode)
             c = _color_for_grade_20(v)
             return QBrush(c) if c else None
         if t == "year_avg":
-            c = _color_for_grade_20(row.get("global_average"))
+            c = _color_for_validation_average(row.get("global_average"))
             return QBrush(c) if c else None
         if t == "year_total":
-            c = _color_for_grade_20(row.get("global_with_jury"))
+            c = _color_for_validation_average(row.get("global_with_jury"))
             return QBrush(c) if c else None
         return None
 
     def _color_for_block_row(self, row: dict[str, Any], block_name: str, mode: str) -> QColor:
-        """Fond bloc : vert seulement si règles de validation (moy. > 10, pas de < 7 non gardées)."""
+        """Fond bloc : vert si validé ; gris si uniquement des UE optionnelles ; sinon rouge."""
         tid = self._current_template_id
         if tid is None:
             return QColor(255, 205, 210)
+        if not self.repo.block_has_mandatory_courses(int(tid), block_name):
+            return _COLOR_NEUTRAL
         sid = int(row.get("student_id") or 0)
         avg = (row.get("blocks") or {}).get(block_name)
         if self.repo.block_is_validated(
@@ -378,7 +437,7 @@ class ResultsTab(QWidget):
         self.template_combo.blockSignals(True)
         try:
             prev = self.template_combo.currentData()
-            templates = self.repo.list_templates()
+            templates = self.repo.list_templates(academic_year=self.default_academic_year or None)
             self.template_ids = [t["id"] for t in templates]
             self.template_combo.clear()
             for t in templates:
@@ -400,6 +459,11 @@ class ResultsTab(QWidget):
         self, template_id: int, *, show_all_ue: bool = False
     ) -> tuple[list[str], list[Callable[[dict[str, Any]], str]]]:
         mode = str(self.session_combo.currentData() or "s1")
+        tpl = next(
+            (x for x in self.repo.list_templates() if int(x["id"]) == int(template_id)),
+            None,
+        ) or {}
+        tpl_ay = str(tpl.get("academic_year") or self.default_academic_year or "").strip()
         from ..services.lookups import student_transcript_number
 
         headers: list[str] = ["N° I.N.E.", "Nom", "Prénom"]
@@ -436,7 +500,9 @@ class ResultsTab(QWidget):
             if expanded:
                 for c in clist:
                     cid = int(c["course_id"])
-                    label, tip = _course_header_labels(c, fm=fm, column_width=_NOTE_COL_WIDTH)
+                    label, tip = _course_header_labels(
+                        c, fm=fm, column_width=_NOTE_COL_WIDTH, academic_year=tpl_ay
+                    )
                     headers.append(label)
 
                     def ue_effective(row: dict[str, Any], _cid: int = cid, _mode: str = mode) -> str:
@@ -563,10 +629,15 @@ class ResultsTab(QWidget):
     def _export_transcripts_all_provisional(self) -> None:
         self._export_transcripts(final=False, force_all=True)
 
+    def _export_transcripts_all_retained(self) -> None:
+        self._export_transcripts(final=False, force_all=True, view_session="mixed")
+
     def _export_transcripts_all_final(self) -> None:
         self._export_transcripts(final=True, force_all=True)
 
-    def _export_transcripts(self, *, final: bool, force_all: bool) -> None:
+    def _export_transcripts(
+        self, *, final: bool, force_all: bool, view_session: str | None = None
+    ) -> None:
         if not self._check_reportlab():
             return
         tid = self._template_id()
@@ -589,7 +660,7 @@ class ResultsTab(QWidget):
             write_institutional_transcript_pdf,
         )
 
-        vs = str(self.session_combo.currentData() or "s1")
+        vs = str(view_session or self.session_combo.currentData() or "s1")
         if len(sids) == 1:
             stu = self.repo.get_student(int(sids[0])) or {}
             tpl = next((t for t in self.repo.list_templates() if int(t["id"]) == int(tid)), {}) or {}
@@ -662,3 +733,41 @@ class ResultsTab(QWidget):
             writer.writerow([h.replace("\n", " ") for h in headers])
             for row in data:
                 writer.writerow([fn(row) for fn in extractors])
+
+    def export_excel(self) -> None:
+        template_id = self.template_combo.currentData()
+        if template_id is None:
+            return
+        tpl = next(
+            (x for x in self.repo.list_templates() if int(x["id"]) == int(template_id)),
+            None,
+        ) or {}
+        ay = str(tpl.get("academic_year") or self.default_academic_year or "").strip()
+        level = str(tpl.get("level") or "M1").strip().upper()
+        if not ay:
+            QMessageBox.warning(self, "Export Excel", "Millésime introuvable pour cette maquette.")
+            return
+        default_name = suggest_notes_workbook_filename(academic_year=ay, level=level)
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Exporter Excel — fichier de notes",
+            str(Path.home() / default_name),
+            "Excel (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            write_results_notes_workbook(
+                self.repo,
+                academic_year=ay,
+                level=level,
+                path=path,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Excel", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "Export Excel",
+            f"Fichier de notes exporté :\n{path}",
+        )

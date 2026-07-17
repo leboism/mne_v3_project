@@ -28,8 +28,11 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.institutions import MNE_CARRIER_PARTNERS, OTHER_CARRIER_DATA
+from ..services.contact_emails import EMAIL_KEYS, EMAIL_LABELS_FR, read_emails
+from ..services.contact_phones import PHONE_LABELS_FR, PHONE_KEYS, read_phones
 from ..services.attachments import COURSE_SYLLABUS_SUFFIXES, abs_path_from_stored
 from .student_files_panel import StudentFilesPanel
+from .student_erasmus_courses_panel import StudentErasmusCoursesPanel
 from .student_internships_panel import StudentInternshipsPanel
 
 from ..core.mne_modules import lookup_mne_module, mne_module_choices, normalize_mne_module_code
@@ -39,14 +42,26 @@ from ..core.parcours import (
     PARCOURS_BY_LEVEL,
     STANDARD_LEVELS,
     suggested_maquette_name,
+    track_display_label,
 )
 
 from ..services.dates import normalize_birth_date_iso
+from ..services.student_funding import (
+    FUNDING_CHOICES,
+    encode_funding_codes,
+    parse_funding_codes,
+)
 from ..services.lookups import (
     adapt_institutional_email,
     is_valid_institutional_email,
     normalize_email,
     suggest_institutional_email,
+)
+from ..services.student_mobility import (
+    MOBILITY_CHOICES,
+    MOBILITY_ERASMUS,
+    MOBILITY_MNE,
+    normalize_mobility_type,
 )
 
 OTHER_INSTITUTION_DATA = "__OTHER_INSTITUTION__"
@@ -72,9 +87,32 @@ class StudentDialog(QDialog):
             self.setWindowTitle("Add student")
         self._repo = repo
         layout = QVBoxLayout(self)
-        tabs = QTabWidget()
-        main_tab = QWidget()
-        form = QFormLayout(main_tab)
+        self.tabs = QTabWidget()
+        tabs = self.tabs
+
+        if student is not None:
+            student = dict(student)
+            if repo is not None and not str(student.get("track") or "").strip():
+                from ..services.student_parcours_repair import infer_student_parcours
+
+                inferred = infer_student_parcours(
+                    repo.db,
+                    int(student["id"]),
+                    str(student.get("academic_year") or ""),
+                )
+                if inferred:
+                    inf_lv, inf_tr, inf_ay = inferred
+                    student["level"] = inf_lv
+                    student["track"] = inf_tr
+                    if inf_ay and not str(student.get("academic_year") or "").strip():
+                        student["academic_year"] = inf_ay
+
+        fiche_scroll = QScrollArea()
+        fiche_scroll.setWidgetResizable(True)
+        fiche_inner = QWidget()
+        fiche_layout = QVBoxLayout(fiche_inner)
+        fiche_layout.setSpacing(14)
+        fiche_layout.setContentsMargins(8, 8, 8, 8)
         self.student_number = QLineEdit()
         self.student_number.setReadOnly(True)
         self.student_number.setPlaceholderText("Ex. MNE-DUPONT-JE-A7K2 (généré à partir de l'identité)")
@@ -105,6 +143,7 @@ class StudentDialog(QDialog):
         self.birth_place = QLineEdit()
         self.email_personal = QLineEdit()
         self.email_institutional = QLineEdit()
+        self.phone = QLineEdit()
         self.enrollment_institution = QComboBox()
         self.enrollment_institution.addItem("—", "")
         self.enrollment_institution.addItem("Université Paris-Saclay", "Université Paris-Saclay")
@@ -130,6 +169,11 @@ class StudentDialog(QDialog):
         self.application_platform_other.setPlaceholderText("Plateforme de candidature")
         self.application_platform.currentIndexChanged.connect(self._platform_changed)
 
+        self.mon_master_ranking = QLineEdit()
+        self.mon_master_ranking.setPlaceholderText(
+            "ex. 1, 10, NC — classement Mon Master (optionnel, import Excel possible)"
+        )
+
         self.acc_tiers_temps = QCheckBox("Tiers temps")
         self.acc_salle_isolee = QCheckBox("Salle isolée")
         self.acc_pc = QCheckBox("PC")
@@ -142,10 +186,27 @@ class StudentDialog(QDialog):
         self.acc_other = QLineEdit()
         self.acc_other.setPlaceholderText("Autres aménagements (texte libre)")
 
+        self.funding_checks: dict[str, QCheckBox] = {}
+        self.funding_row = QWidget()
+        funding_layout = QHBoxLayout(self.funding_row)
+        funding_layout.setContentsMargins(0, 0, 0, 0)
+        for code, label in FUNDING_CHOICES:
+            cb = QCheckBox(label)
+            self.funding_checks[code] = cb
+            funding_layout.addWidget(cb)
+        self.funding_other = QLineEdit()
+        self.funding_other.setPlaceholderText("Autre bourse ou exemption (texte libre)")
+
         self.notes = QTextEdit()
         self.notes.setPlaceholderText("Notes / commentaires supplémentaires…")
 
         self.academic_year = QLineEdit()
+        self.academic_year.textEdited.connect(self._on_academic_year_edited)
+
+        self.mobility_combo = QComboBox()
+        for code, label in MOBILITY_CHOICES:
+            self.mobility_combo.addItem(label, code)
+        self.mobility_combo.currentIndexChanged.connect(self._on_mobility_changed)
 
         self.level_combo = QComboBox()
         for lv in STANDARD_LEVELS:
@@ -194,6 +255,7 @@ class StudentDialog(QDialog):
             self.birth_place.setText(str(student.get("birth_place") or ""))
             self.email_personal.setText(str(student.get("email_personal") or ""))
             self.email_institutional.setText(str(student.get("email_institutional") or ""))
+            self.phone.setText(str(student.get("phone") or ""))
             inst = str(student.get("enrollment_institution") or "").strip()
             ii = self.enrollment_institution.findData(inst)
             if ii >= 0:
@@ -212,14 +274,23 @@ class StudentDialog(QDialog):
                 if oi >= 0:
                     self.application_platform.setCurrentIndex(oi)
                     self.application_platform_other.setText(plat)
+            self.mon_master_ranking.setText(str(student.get("mon_master_ranking") or ""))
             acc = str(student.get("accommodations") or "")
             acc_set = {x.strip().lower() for x in acc.split(",") if x and x.strip()}
             self.acc_tiers_temps.setChecked("tiers_temps" in acc_set or "tier_temps" in acc_set)
             self.acc_salle_isolee.setChecked("salle_isolee" in acc_set)
             self.acc_pc.setChecked("pc" in acc_set)
             self.acc_other.setText(str(student.get("accommodations_other") or ""))
+            funding_set = parse_funding_codes(str(student.get("funding") or ""))
+            for code, cb in self.funding_checks.items():
+                cb.setChecked(code in funding_set)
+            self.funding_other.setText(str(student.get("funding_other") or ""))
             self.notes.setPlainText(str(student.get("notes") or ""))
             self.academic_year.setText(str(student.get("academic_year") or ""))
+            mob = normalize_mobility_type(student.get("mobility_type"))
+            mi = self.mobility_combo.findData(mob)
+            if mi >= 0:
+                self.mobility_combo.setCurrentIndex(mi)
             self._apply_student_level_track(
                 str(student.get("level") or ""),
                 str(student.get("track") or ""),
@@ -230,38 +301,82 @@ class StudentDialog(QDialog):
         else:
             self._student_level_changed()
 
+        identity_box = QGroupBox("Identité")
+        form = QFormLayout(identity_box)
+        form.setVerticalSpacing(10)
+        form.setHorizontalSpacing(12)
         if student is not None:
             form.addRow("Identifiant interne (base)", self.student_number)
         form.addRow("N° I.N.E.", self.student_number_ine)
         form.addRow("N° inscription (établissement)", self.student_number_local)
-        form.addRow("Last name", self.last_name)
-        form.addRow("First name", self.first_name)
+        form.addRow("Nom", self.last_name)
+        form.addRow("Prénom", self.first_name)
         form.addRow("Genre", self.gender)
-        form.addRow("Birth date", self.birth_date)
-        form.addRow("Nationality", self.nationality)
-        form.addRow("Établissement d’origine", self.origin_institution)
-        form.addRow("Pays (établ. d’origine)", self.origin_institution_country)
-        form.addRow("Plus haut diplôme actuel", self.highest_diploma)
-        form.addRow("Birth place", self.birth_place)
-        form.addRow("Email (personal)", self.email_personal)
-        form.addRow("Email (institutional)", self.email_institutional)
-        form.addRow("Établissement d’inscription", self.enrollment_institution)
-        form.addRow("", self.enrollment_institution_other)
-        form.addRow("Plateforme de candidature", self.application_platform)
-        form.addRow("", self.application_platform_other)
-        form.addRow("Aménagement d’études", self.acc_row)
-        form.addRow("", self.acc_other)
-        form.addRow("Notes", self.notes)
-        form.addRow("Niveau", self.level_row)
-        form.addRow("Parcours", self.track_row)
-        form.addRow("Academic year", self.academic_year)
-        tabs.addTab(main_tab, "Fiche")
+        form.addRow("Date de naissance", self.birth_date)
+        form.addRow("Nationalité", self.nationality)
+        form.addRow("Lieu de naissance", self.birth_place)
+
+        scolarite_box = QGroupBox("Scolarité MNE")
+        scolarite_form = QFormLayout(scolarite_box)
+        scolarite_form.setVerticalSpacing(10)
+        scolarite_form.setHorizontalSpacing(12)
+        scolarite_form.addRow("Établissement d’origine", self.origin_institution)
+        scolarite_form.addRow("Pays (établ. d’origine)", self.origin_institution_country)
+        scolarite_form.addRow("Plus haut diplôme actuel", self.highest_diploma)
+        scolarite_form.addRow("Profil", self.mobility_combo)
+        scolarite_form.addRow("Niveau", self.level_row)
+        scolarite_form.addRow("Parcours", self.track_row)
+        scolarite_form.addRow("Année universitaire", self.academic_year)
+
+        contact_box = QGroupBox("Contact & inscription")
+        contact_form = QFormLayout(contact_box)
+        contact_form.setVerticalSpacing(10)
+        contact_form.setHorizontalSpacing(12)
+        contact_form.addRow("Email personnel", self.email_personal)
+        contact_form.addRow("Email institutionnel", self.email_institutional)
+        contact_form.addRow("Téléphone", self.phone)
+        contact_form.addRow("Établissement d’inscription", self.enrollment_institution)
+        contact_form.addRow("", self.enrollment_institution_other)
+        contact_form.addRow("Plateforme de candidature", self.application_platform)
+        contact_form.addRow("", self.application_platform_other)
+        contact_form.addRow("Classement Mon Master", self.mon_master_ranking)
+
+        funding_box = QGroupBox("Bourses & frais")
+        funding_form = QFormLayout(funding_box)
+        funding_form.setVerticalSpacing(10)
+        funding_form.setHorizontalSpacing(12)
+        funding_form.addRow("Bourses / exemptions", self.funding_row)
+        funding_form.addRow("", self.funding_other)
+
+        extras_box = QGroupBox("Aménagements & notes")
+        extras_form = QFormLayout(extras_box)
+        extras_form.setVerticalSpacing(10)
+        extras_form.setHorizontalSpacing(12)
+        extras_form.addRow("Aménagement d’études", self.acc_row)
+        extras_form.addRow("", self.acc_other)
+        self.notes.setMaximumHeight(100)
+        extras_form.addRow("Notes", self.notes)
+
+        fiche_layout.addWidget(identity_box)
+        fiche_layout.addWidget(scolarite_box)
+        fiche_layout.addWidget(contact_box)
+        fiche_layout.addWidget(funding_box)
+        fiche_layout.addWidget(extras_box)
+        fiche_layout.addStretch()
+        fiche_scroll.setWidget(fiche_inner)
+        tabs.addTab(fiche_scroll, "Fiche")
         sid = int(student["id"]) if student is not None else None
+        ay_init = self.academic_year.text().strip() or default_academic_year
+        self.erasmus_panel = StudentErasmusCoursesPanel(
+            self, repo=repo, student_id=sid, academic_year=ay_init
+        )
+        self._erasmus_tab_index = tabs.addTab(self.erasmus_panel, "ERASMUS — UE suivies")
+        tabs.setTabVisible(self._erasmus_tab_index, self.mobility_value() == MOBILITY_ERASMUS)
         self.files_panel = StudentFilesPanel(self, repo=repo, student_id=sid)
         tabs.addTab(self.files_panel, "Photo & documents")
         self.internships_panel = StudentInternshipsPanel(self, repo=repo, student_id=sid)
         tabs.addTab(self.internships_panel, "Stages")
-        layout.addWidget(tabs)
+        layout.addWidget(self.tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -271,35 +386,77 @@ class StudentDialog(QDialog):
         self._suppress_institution_email = False
         if student is None:
             self._apply_institution_email()
+        self._on_mobility_changed()
         from .screen_layout import adapt_window_size
 
-        adapt_window_size(self, preferred=(860, 640), minimum=(640, 520))
+        adapt_window_size(self, preferred=(900, 720), minimum=(680, 560))
+
+    def mobility_value(self) -> str:
+        return normalize_mobility_type(self.mobility_combo.currentData())
+
+    def _on_mobility_changed(self) -> None:
+        erasmus = self.mobility_value() == MOBILITY_ERASMUS
+        self.level_row.setVisible(not erasmus)
+        self.track_row.setVisible(not erasmus)
+        if hasattr(self, "_erasmus_tab_index"):
+            self.tabs.setTabVisible(self._erasmus_tab_index, erasmus)
+        if hasattr(self, "erasmus_panel"):
+            self.erasmus_panel.set_academic_year(self.academic_year.text().strip())
+
+    def _on_academic_year_edited(self, _text: str) -> None:
+        if hasattr(self, "erasmus_panel"):
+            self.erasmus_panel.set_academic_year(self.academic_year.text().strip())
 
     def _apply_student_level_track(self, level: str, track: str) -> None:
+        from ..services.student_parcours_repair import is_academic_year_label
+
         lv = (level or "").strip().upper()
-        tr = (track or "").strip()
-        if lv in PARCOURS_BY_LEVEL:
-            i = self.level_combo.findData(lv)
-            if i >= 0:
-                self.level_combo.setCurrentIndex(i)
-            self._student_level_changed()
-            ti = self.track_combo.findData(tr)
-            if ti >= 0:
-                self.track_combo.setCurrentIndex(ti)
-            elif tr:
-                oi = self.track_combo.findData(OTHER_TRACK_DATA)
-                if oi >= 0:
-                    self.track_combo.setCurrentIndex(oi)
-                    self.track_other.setText(tr)
-            return
-        oi = self.level_combo.findData(OTHER_LEVEL_DATA)
-        if oi >= 0:
-            self.level_combo.setCurrentIndex(oi)
-        self.level_other.setText(level or "")
-        self._student_level_changed()
-        self.track_other.setText(tr)
+        tr = (track or "").strip().upper()
+        tr = "P" if tr in {"M1P"} else ("C" if tr in {"M1C"} else tr)
+        if is_academic_year_label(tr):
+            tr = ""
+        if is_academic_year_label(lv):
+            lv = ""
+        self._suppress_level_changed = True
+        self.level_combo.blockSignals(True)
+        self.track_combo.blockSignals(True)
+        try:
+            if lv in PARCOURS_BY_LEVEL:
+                i = self.level_combo.findData(lv)
+                if i >= 0:
+                    self.level_combo.setCurrentIndex(i)
+                self._repopulate_track_combo_for_level()
+                ti = self.track_combo.findData(tr) if tr else -1
+                if ti >= 0:
+                    self.track_combo.setCurrentIndex(ti)
+                elif tr:
+                    oi = self.track_combo.findData(OTHER_TRACK_DATA)
+                    if oi >= 0:
+                        self.track_combo.setCurrentIndex(oi)
+                        self.track_other.setText(tr)
+                else:
+                    blank = self.track_combo.findData("")
+                    if blank >= 0:
+                        self.track_combo.setCurrentIndex(blank)
+                return
+            oi = self.level_combo.findData(OTHER_LEVEL_DATA)
+            if oi >= 0:
+                self.level_combo.setCurrentIndex(oi)
+            self.level_other.setText(level or "")
+            self._repopulate_track_combo_for_level()
+            self.track_other.setText(tr)
+        finally:
+            self.track_combo.blockSignals(False)
+            self.level_combo.blockSignals(False)
+            self._suppress_level_changed = False
+            self._student_track_changed()
 
     def _student_level_changed(self) -> None:
+        if getattr(self, "_suppress_level_changed", False):
+            return
+        self._repopulate_track_combo_for_level()
+
+    def _repopulate_track_combo_for_level(self) -> None:
         is_other = self.level_combo.currentData() == OTHER_LEVEL_DATA
         self.level_other.setVisible(is_other)
         if is_other:
@@ -313,8 +470,9 @@ class StudentDialog(QDialog):
         lvl = str(self.level_combo.currentData() or "")
         self.track_combo.blockSignals(True)
         self.track_combo.clear()
-        for code, lab in PARCOURS_BY_LEVEL.get(lvl, ()):
-            self.track_combo.addItem(f"{lab} ({code})", code)
+        self.track_combo.addItem("— (non renseigné)", "")
+        for code, _lab in PARCOURS_BY_LEVEL.get(lvl, ()):
+            self.track_combo.addItem(track_display_label(lvl, code), code)
         self.track_combo.addItem("Autre (saisie libre)", OTHER_TRACK_DATA)
         self.track_combo.blockSignals(False)
         self._student_track_changed()
@@ -402,6 +560,37 @@ class StudentDialog(QDialog):
         super().accept()
 
     def persist_update(self, repo: Any, student_id: int, student_number: str) -> None:
+        from ..services.student_parcours_repair import (
+            coalesce_student_parcours_fields,
+            infer_student_parcours,
+        )
+
+        existing = repo.get_student(int(student_id)) or {}
+        form_track = self.track_value()
+        mob = self.mobility_value()
+        if mob == MOBILITY_ERASMUS:
+            level, track, academic_year = (
+                "",
+                "",
+                self.academic_year.text().strip(),
+            )
+        else:
+            level, track, academic_year = coalesce_student_parcours_fields(
+                self.level_value(),
+                form_track,
+                self.academic_year.text().strip(),
+                existing,
+            )
+            if not form_track and not track:
+                inferred = infer_student_parcours(repo.db, int(student_id), academic_year)
+                if inferred:
+                    inf_lv, inf_tr, inf_ay = inferred
+                    level, track, academic_year = coalesce_student_parcours_fields(
+                        inf_lv or level,
+                        inf_tr,
+                        inf_ay or academic_year,
+                        existing,
+                    )
         repo.update_student(
             int(student_id),
             student_number,
@@ -409,16 +598,20 @@ class StudentDialog(QDialog):
             self.student_number_local.text().strip(),
             self.last_name.text().strip(),
             self.first_name.text().strip(),
-            normalize_email(self.email_personal.text()),
-            self.resolved_institutional_email(),
-            self.enrollment_institution_value(),
-            self.application_platform_value(),
-            self.accommodations_value(),
-            self.accommodations_other_value(),
-            self.notes_value(),
-            self.level_value(),
-            self.track_value(),
-            self.academic_year.text().strip(),
+            email_personal=normalize_email(self.email_personal.text()),
+            email_institutional=self.resolved_institutional_email(),
+            phone=self.phone.text().strip(),
+            enrollment_institution=self.enrollment_institution_value(),
+            application_platform=self.application_platform_value(),
+            mon_master_ranking=self.mon_master_ranking.text().strip(),
+            accommodations=self.accommodations_value(),
+            accommodations_other=self.accommodations_other_value(),
+            funding=self.funding_value(),
+            funding_other=self.funding_other_value(),
+            notes=self.notes_value(),
+            level=level,
+            track=track,
+            academic_year=academic_year,
             birth_date=self.resolved_birth_date(),
             nationality=self.nationality.text().strip(),
             birth_place=self.birth_place.text().strip(),
@@ -426,11 +619,16 @@ class StudentDialog(QDialog):
             origin_institution=self.origin_institution_value(),
             origin_institution_country=self.origin_institution_country_value(),
             highest_diploma=self.highest_diploma_value(),
+            mobility_type=mob,
         )
         self.apply_pending_files(repo, int(student_id))
-        repo.sync_enrollments_for_student(int(student_id))
+        if mob == MOBILITY_ERASMUS:
+            self.erasmus_panel.persist(repo, int(student_id), academic_year)
+        else:
+            repo.sync_enrollments_for_student(int(student_id))
 
     def persist_create(self, repo: Any) -> int:
+        mob = self.mobility_value()
         new_id = repo.add_student(
             "",
             self.student_number_ine.text().strip(),
@@ -439,13 +637,17 @@ class StudentDialog(QDialog):
             self.first_name.text().strip(),
             normalize_email(self.email_personal.text()),
             self.resolved_institutional_email(),
+            self.phone.text().strip(),
             self.enrollment_institution_value(),
             self.application_platform_value(),
+            self.mon_master_ranking.text().strip(),
             self.accommodations_value(),
             self.accommodations_other_value(),
+            self.funding_value(),
+            self.funding_other_value(),
             self.notes_value(),
-            self.level_value(),
-            self.track_value(),
+            "" if mob == MOBILITY_ERASMUS else self.level_value(),
+            "" if mob == MOBILITY_ERASMUS else self.track_value(),
             self.academic_year.text().strip(),
             birth_date=self.resolved_birth_date(),
             nationality=self.nationality.text().strip(),
@@ -454,9 +656,15 @@ class StudentDialog(QDialog):
             origin_institution=self.origin_institution_value(),
             origin_institution_country=self.origin_institution_country_value(),
             highest_diploma=self.highest_diploma_value(),
+            mobility_type=mob,
         )
         self.apply_pending_files(repo, new_id)
-        repo.sync_enrollments_for_student(new_id)
+        ay = self.academic_year.text().strip()
+        if mob == MOBILITY_ERASMUS:
+            self.erasmus_panel.set_context(repo, new_id, ay)
+            self.erasmus_panel.persist(repo, new_id, ay)
+        else:
+            repo.sync_enrollments_for_student(new_id)
         return new_id
 
     def _platform_changed(self) -> None:
@@ -469,11 +677,12 @@ class StudentDialog(QDialog):
         return str(self.level_combo.currentData() or "").strip()
 
     def track_value(self) -> str:
-        if not self.track_combo.isVisible():
+        if self.level_combo.currentData() == OTHER_LEVEL_DATA:
             return self.track_other.text().strip()
-        if self.track_combo.currentData() == OTHER_TRACK_DATA:
+        data = self.track_combo.currentData()
+        if data == OTHER_TRACK_DATA:
             return self.track_other.text().strip()
-        return str(self.track_combo.currentData() or "").strip()
+        return str(data if data is not None else "").strip()
 
     def enrollment_institution_value(self) -> str:
         if self.enrollment_institution.currentData() == OTHER_INSTITUTION_DATA:
@@ -497,6 +706,13 @@ class StudentDialog(QDialog):
 
     def accommodations_other_value(self) -> str:
         return self.acc_other.text().strip()
+
+    def funding_value(self) -> str:
+        selected = {code for code, cb in self.funding_checks.items() if cb.isChecked()}
+        return encode_funding_codes(selected)
+
+    def funding_other_value(self) -> str:
+        return self.funding_other.text().strip()
 
     def notes_value(self) -> str:
         return self.notes.toPlainText().strip()
@@ -620,17 +836,26 @@ class CourseDialog(QDialog):
         self.mcc_text.setMinimumHeight(100)
 
         self.is_internship = QCheckBox("UE de type stage (suivi dédié dans l’onglet Notes)")
+        self.is_internship.toggled.connect(self._on_internship_toggled)
         teacher_box = QGroupBox("Enseignant responsable")
         tf = QFormLayout(teacher_box)
         self.teacher_last_name = QLineEdit()
         self.teacher_first_name = QLineEdit()
-        self.teacher_email = QLineEdit()
-        self.teacher_phone = QLineEdit()
+        self.teacher_email_work = QLineEdit()
+        self.teacher_email_work_2 = QLineEdit()
+        self.teacher_email_personal = QLineEdit()
+        self.teacher_phone_work = QLineEdit()
+        self.teacher_phone_work_2 = QLineEdit()
+        self.teacher_phone_mobile = QLineEdit()
         self.teacher_institution = QLineEdit()
         tf.addRow("Nom", self.teacher_last_name)
         tf.addRow("Prénom", self.teacher_first_name)
-        tf.addRow("Email", self.teacher_email)
-        tf.addRow("Téléphone", self.teacher_phone)
+        tf.addRow(EMAIL_LABELS_FR[EMAIL_KEYS[0]], self.teacher_email_work)
+        tf.addRow(EMAIL_LABELS_FR[EMAIL_KEYS[1]], self.teacher_email_work_2)
+        tf.addRow(EMAIL_LABELS_FR[EMAIL_KEYS[2]], self.teacher_email_personal)
+        tf.addRow(PHONE_LABELS_FR[PHONE_KEYS[0]], self.teacher_phone_work)
+        tf.addRow(PHONE_LABELS_FR[PHONE_KEYS[1]], self.teacher_phone_work_2)
+        tf.addRow(PHONE_LABELS_FR[PHONE_KEYS[2]], self.teacher_phone_mobile)
         tf.addRow("Établissement", self.teacher_institution)
 
         carrier_box = QGroupBox("Porteur MNE")
@@ -707,8 +932,14 @@ class CourseDialog(QDialog):
             )
             self.teacher_last_name.setText(str(course.get("teacher_last_name") or ""))
             self.teacher_first_name.setText(str(course.get("teacher_first_name") or ""))
-            self.teacher_email.setText(str(course.get("teacher_email") or ""))
-            self.teacher_phone.setText(str(course.get("teacher_phone") or ""))
+            ew, ew2, ep = read_emails(course, prefix="teacher")
+            self.teacher_email_work.setText(ew)
+            self.teacher_email_work_2.setText(ew2)
+            self.teacher_email_personal.setText(ep)
+            tw, tw2, tm = read_phones(course, prefix="teacher")
+            self.teacher_phone_work.setText(tw)
+            self.teacher_phone_work_2.setText(tw2)
+            self.teacher_phone_mobile.setText(tm)
             self.teacher_institution.setText(str(course.get("teacher_institution") or ""))
             cp = str(course.get("carrier_partner") or "").strip()
             ci = self.carrier_partner.findData(cp)
@@ -780,8 +1011,14 @@ class CourseDialog(QDialog):
             "course_type": "internship" if self.is_internship.isChecked() else "standard",
             "teacher_last_name": self.teacher_last_name.text().strip(),
             "teacher_first_name": self.teacher_first_name.text().strip(),
-            "teacher_email": self.teacher_email.text().strip(),
-            "teacher_phone": self.teacher_phone.text().strip(),
+            "teacher_email_work": self.teacher_email_work.text().strip(),
+            "teacher_email_work_2": self.teacher_email_work_2.text().strip(),
+            "teacher_email_personal": self.teacher_email_personal.text().strip(),
+            "teacher_email": self.teacher_email_work.text().strip(),
+            "teacher_phone_work": self.teacher_phone_work.text().strip(),
+            "teacher_phone_work_2": self.teacher_phone_work_2.text().strip(),
+            "teacher_phone_mobile": self.teacher_phone_mobile.text().strip(),
+            "teacher_phone": self.teacher_phone_mobile.text().strip(),
             "teacher_institution": self.teacher_institution.text().strip(),
             "carrier_partner": self.carrier_partner_value(),
             "carrier_partner_other": (
@@ -875,6 +1112,15 @@ class CourseDialog(QDialog):
             self._stored_syllabus_name = str(row.get("syllabus_filename") or "")
             self._pending_syllabus = None
         self._refresh_syllabus_label()
+
+    def _on_internship_toggled(self, checked: bool) -> None:
+        if not checked:
+            return
+        if self.mcc_text.toPlainText().strip():
+            return
+        from ..services.internship_grades import INTERNSHIP_MCC_TEXT
+
+        self.mcc_text.setPlainText(INTERNSHIP_MCC_TEXT)
 
     def _try_accept(self) -> None:
         from PySide6.QtWidgets import QMessageBox
@@ -1105,15 +1351,20 @@ class TemplateDialog(QDialog):
         self.accept()
 
 
+from ..services.timetable_legacy import course_public_code
+
+
 class AddCourseToTemplateDialog(QDialog):
-    def __init__(self, courses: list[dict], parent=None):
+    def __init__(self, courses: list[dict], parent=None, *, academic_year: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Add course to template")
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.course = QComboBox()
+        ay = str(academic_year or "").strip()
         for c in courses:
-            self.course.addItem(f"{c['code']} - {c['name']}", c["id"])
+            pub = course_public_code(c, academic_year=ay)
+            self.course.addItem(f"{pub} - {c['name']}", c["id"])
         self.block_name = QLineEdit()
         self.global_coefficient = QDoubleSpinBox()
         self.global_coefficient.setRange(0, 100)
@@ -1168,7 +1419,11 @@ class EditMaquettePlacementDialog(QDialog):
         )
         self.free_ue.setChecked(bool(int(free_ue)))
         form.addRow("Block name", self.block_name)
-        form.addRow("Coefficient (template)", self.global_coefficient)
+        form.addRow("Pondération (= ECTS)", self.global_coefficient)
+        self.global_coefficient.setToolTip(
+            "Utilisée pour les moyennes bloc/année si les ECTS de l’UE sont à 0 ; "
+            "sinon les ECTS priment automatiquement."
+        )
         form.addRow("Display order", self.display_order)
         form.addRow("Optional (0/1)", self.optional)
         form.addRow("", self.free_ue)

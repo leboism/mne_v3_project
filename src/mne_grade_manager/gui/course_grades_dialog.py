@@ -34,6 +34,7 @@ class _ColMap:
     coefficient: float
     assessment_id: int
     header: str
+    name: str = ""
 
 
 def _norm_number(s: Any) -> str:
@@ -89,7 +90,7 @@ class CourseGradesDialog(QDialog):
         self.entry_session = QComboBox()
         self.entry_session.addItem("Saisie : Session 1", 1)
         self.entry_session.addItem("Saisie : Session 2", 2)
-        self.entry_session.currentIndexChanged.connect(lambda _idx: self.refresh())
+        self.entry_session.currentIndexChanged.connect(self._on_entry_session_changed)
         self.export_template_btn = QPushButton("Générer modèle Excel…")
         self.export_template_btn.clicked.connect(self.export_template_xlsx)
         self.export_grades_btn = QPushButton("Exporter notes (Excel)…")
@@ -121,6 +122,7 @@ class CourseGradesDialog(QDialog):
         self._show_parcours_col = False
         self._student_template_by_id: dict[int, int] = {}
         self._scope_academic_year = ""
+        self._info_base_html = ""
 
         if self._course_is_multi_parcours():
             self.scope_common.setChecked(True)
@@ -188,7 +190,7 @@ class CourseGradesDialog(QDialog):
                 )
                 parcours_txt = ", ".join(parcours_bits) if parcours_bits else "—"
                 self._student_rows = self.repo.list_students_for_course_in_templates(
-                    self.course_id, template_ids
+                    self.course_id, template_ids, academic_year=ay
                 )
                 self._student_template_by_id = self.repo.student_templates_for_course(
                     self.course_id, template_ids
@@ -201,7 +203,7 @@ class CourseGradesDialog(QDialog):
                 )
             if template_ids:
                 self._student_rows = self.repo.list_students_for_course_in_templates(
-                    self.course_id, template_ids
+                    self.course_id, template_ids, academic_year=ay
                 )
                 self._student_template_by_id = self.repo.student_templates_for_course(
                     self.course_id, template_ids
@@ -220,13 +222,36 @@ class CourseGradesDialog(QDialog):
         suffix = f" ({lv} {tr})".strip() if lv or tr else ""
         return f"Maquette courante{suffix}"
 
+    def _on_entry_session_changed(self) -> None:
+        self._update_entry_session_hint()
+
+    def _update_entry_session_hint(self) -> None:
+        sess = int(self.entry_session.currentData() or 1)
+        if sess == 2:
+            save_txt = (
+                "<br/><i>Enregistrement</i> : seules les colonnes <b>session 2</b> "
+                "seront écrites en base."
+            )
+        else:
+            save_txt = (
+                "<br/><i>Enregistrement</i> : seules les colonnes <b>session 1</b> "
+                "seront écrites en base."
+            )
+        self.info.setText((self._info_base_html or "") + save_txt)
+
     def refresh(self) -> None:
+        try:
+            from ..services.internship_grades import ensure_internship_mcc_and_assessments
+
+            ensure_internship_mcc_and_assessments(self.repo, self.course_id)
+        except Exception:
+            pass
         course = self.repo.get_course(self.course_id) or {}
         title = f"{course.get('code','')} — {course.get('name','')}".strip(" —")
         scope_txt = self._load_student_scope()
         self._first_grade_col = 4 if self._show_parcours_col else 3
 
-        self.info.setText(
+        self._info_base_html = (
             f"<b>{title}</b><br/>"
             f"<i>Périmètre</i> : {scope_txt} — <b>{len(self._student_rows)}</b> étudiant(s)<br/>"
             "Collez un tableau depuis Excel (Ctrl/Cmd+V) ou importez un .xlsx. "
@@ -235,7 +260,20 @@ class CourseGradesDialog(QDialog):
             "Valeurs : nombre, ABJ, DEF, NEUT, VAL — ou cochez « Validée » pour valider l’UE "
             "sans note chiffrée (UE libre, équivalence, etc.)."
         )
+        self._update_entry_session_hint()
         assessments = self.repo.list_assessments(self.course_id)
+        if not assessments:
+            try:
+                from ..services.internship_grades import (
+                    ensure_internship_mcc_and_assessments,
+                    is_internship_course_data,
+                )
+
+                if is_internship_course_data(course):
+                    ensure_internship_mcc_and_assessments(self.repo, self.course_id)
+                    assessments = self.repo.list_assessments(self.course_id)
+            except Exception:
+                pass
 
         # Build column maps: one column per assessment (session+kind+coef)
         self._col_maps = []
@@ -251,6 +289,7 @@ class CourseGradesDialog(QDialog):
                     coefficient=float(a["coefficient"]),
                     assessment_id=int(a["id"]),
                     header=str(headers[-1]),
+                    name=str(a.get("name") or ""),
                 )
             )
         headers.append("Validée")
@@ -279,8 +318,10 @@ class CourseGradesDialog(QDialog):
         for r, s in enumerate(self._student_rows):
             sid = int(s["id"])
             tid = self._template_for_student(sid)
-            if self.repo.is_sent_to_second_session(sid, tid, self.course_id):
-                self.repo.carry_over_reprise_grades_from_session1(sid, self.course_id)
+            if not self.repo.is_sent_to_second_session(sid, tid, self.course_id):
+                self.repo.purge_carried_s2_reprises_without_send(
+                    sid, self.course_id, template_id=tid
+                )
             rows = self.repo.get_grades_for_student_course(sid, self.course_id)
             by_assessment = {int(x["assessment_id"]): x for x in rows}
             self._existing_locked[int(s["id"])] = {
@@ -295,6 +336,8 @@ class CourseGradesDialog(QDialog):
                         g.get("grade"),
                         g.get("status"),
                         assessment_session=int(g.get("session") or 1),
+                        assessment_kind=str(cm.kind),
+                        assessment_name=str(cm.name),
                     )
                 it = QTableWidgetItem(txt)
                 self.table.setItem(r, c, it)
@@ -495,6 +538,7 @@ class CourseGradesDialog(QDialog):
                             status="OK",
                             locked=0,
                             comment="",
+                            trigger_carry_over=False,
                         )
                         continue
                     grade, status, err = parse_grade_cell(raw)

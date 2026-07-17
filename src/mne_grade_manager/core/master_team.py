@@ -2,33 +2,65 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from .parcours import PARCOURS_BY_LEVEL, track_label
 
 ROLE_MENTION = "mention"
 ROLE_TRACK = "track"
 ROLE_SECRETARIAT = "secretariat"
+ROLE_STUDENT_REP = "student_rep"
 
 # Trois directeurs de la mention (ensemble du master MNE).
 MENTION_DIRECTOR_COUNT = 3
+
+# Représentants des étudiants : 2 pour l'ensemble du M1, 2 par parcours en M2.
+STUDENT_REP_COUNT_M1 = 2
+STUDENT_REP_COUNT_M2_PER_TRACK = 2
+
+# Responsables de parcours : 1 en M1, 2 en M2 par parcours.
+TRACK_DIRECTOR_COUNT_M1 = 1
+TRACK_DIRECTOR_COUNT_M2_PER_TRACK = 2
 
 ROLE_LABELS: dict[str, str] = {
     ROLE_MENTION: "Directeur de la mention",
     ROLE_TRACK: "Responsable de parcours",
     ROLE_SECRETARIAT: "Secrétariat pédagogique",
+    ROLE_STUDENT_REP: "Représentant des étudiants",
 }
 
 
 def mention_director_label(slot: int) -> str:
-    """Libellé de poste pour le slot 0…2."""
+    """Libellé de poste par défaut pour le slot 0…2."""
     n = int(slot) + 1
     return f"Directeur {n} de la mention"
 
-# Établissements d'inscription (aligné sur la fiche étudiant).
+
+def mention_director_post_label(row: dict[str, Any] | None, slot: int) -> str:
+    """Intitulé de poste affiché (personnalisé ou défaut)."""
+    if row:
+        custom = str(row.get("post_label") or "").strip()
+        if custom:
+            return custom
+    return mention_director_label(slot)
+
+# Établissements d'inscription étudiants (fiche étudiant).
 MNE_ENROLLMENT_INSTITUTIONS: tuple[str, ...] = (
     "Université Paris-Saclay",
     "Institut Polytechnique de Paris",
     "Chimie Paris PSL",
     "ENSTA Paris",
+)
+
+# Affiliations des responsables pédagogiques (directeurs, parcours, secrétariat).
+MNE_TEAM_AFFILIATIONS: tuple[str, ...] = (
+    "Université Paris-Saclay",
+    "ENSTA Paris",
+    "Chimie ParisTech-PSL",
+    "CentraleSupélec",
+    "CEA / INSTN",
+    "École des Ponts ParisTech",
+    "Institut Polytechnique de Paris",
 )
 
 
@@ -69,4 +101,27 @@ def all_track_pairs() -> list[tuple[str, str, str]]:
     for lv, tracks in PARCOURS_BY_LEVEL.items():
         for code, _lab in tracks:
             out.append((lv, code, f"{lv} {track_label(lv, code)}"))
+    return out
+
+
+def m2_track_pairs() -> list[tuple[str, str, str]]:
+    """Parcours M2 uniquement (représentants étudiants)."""
+    return [(lv, code, lab) for lv, code, lab in all_track_pairs() if lv == "M2"]
+
+
+def track_director_slot_count(level: str) -> int:
+    """Nombre de responsables pour un parcours (1 en M1, 2 en M2)."""
+    if str(level or "").strip().upper() == "M2":
+        return TRACK_DIRECTOR_COUNT_M2_PER_TRACK
+    return TRACK_DIRECTOR_COUNT_M1
+
+
+def track_director_table_rows() -> list[tuple[str, str, str, int]]:
+    """(niveau, parcours, libellé ligne, slot) pour le tableau responsables."""
+    out: list[tuple[str, str, str, int]] = []
+    for lv, code, lab in all_track_pairs():
+        slots = track_director_slot_count(lv)
+        for slot in range(slots):
+            row_lab = f"{lab} — resp. {slot + 1}" if slots > 1 else lab
+            out.append((lv, code, row_lab, slot))
     return out

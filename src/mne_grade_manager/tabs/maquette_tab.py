@@ -29,10 +29,12 @@ from ..gui.dialogs import (
 from ..gui.maquette_import_dialog import MaquetteImportDialog
 from ..services.maquette_export import export_template_to_maquette_xlsx
 from ..services.maquette_import import (
+    apply_secretariat_course_codes,
     enrich_maquette_rows_mne_codes,
     extract_academic_year_from_path,
     load_maquette_sheet,
 )
+from ..services.timetable_legacy import course_public_code
 from ..services.dates import suggest_next_academic_year
 from ..services.maquette_io import import_maquette_row_dicts
 from ..gui.widgets import make_actions_toolbar
@@ -43,10 +45,11 @@ def _course_fields_from_dialog(dlg: CourseDialog) -> dict:
 
 
 class MaquetteTab(QWidget):
-    def __init__(self, repo, refresh_callbacks=None):
+    def __init__(self, repo, refresh_callbacks=None, *, default_academic_year: str = ""):
         super().__init__()
         self.repo = repo
         self.refresh_callbacks = refresh_callbacks or []
+        self.default_academic_year = (default_academic_year or "").strip()
         self._template_ids: list[int] = []
         layout = QVBoxLayout(self)
 
@@ -55,6 +58,7 @@ class MaquetteTab(QWidget):
             "(M1&nbsp;: P ou C ; M2&nbsp;: NPD, NPO, DWM, NFC, NRPE). "
             "Pour conserver l’historique (relevés dans 5–10 ans), <b>dupliquez</b> ou "
             "<b>reportez</b> vers l’année suivante plutôt que de modifier une maquette passée. "
+            "La <b>pondération</b> des moyennes (bloc / année) suit les <b>ECTS</b> de chaque UE. "
             "Chaque copie enregistre sa filiation (maquette parente, version, millésime)."
         )
         intro.setWordWrap(True)
@@ -83,6 +87,8 @@ class MaquetteTab(QWidget):
                     [
                         ("Importer Excel (.xlsx)…", self.import_maquette),
                         ("Exporter Excel (.xlsx)…", self.export_maquette),
+                        ("Réparer codes secrétariat (millésime)…", self.repair_millésime_course_codes),
+                        ("Appliquer maquettes officielles 2026-2027…", self.apply_official_maquettes),
                     ],
                     [
                         ("Retirer l'UE de la maquette", self.remove_ue_from_maquette),
@@ -141,7 +147,7 @@ class MaquetteTab(QWidget):
         return out
 
     def refresh(self) -> None:
-        templates = self.repo.list_templates()
+        templates = self.repo.list_templates(academic_year=self.default_academic_year or None)
         self._template_ids = [t["id"] for t in templates]
         self.maquette_list.clear()
         for t in templates:
@@ -182,16 +188,17 @@ class MaquetteTab(QWidget):
             self.lineage_label.setText("")
             return
         rows = self.repo.list_template_courses(tid)
-        headers = ["Code", "Name", "Block", "Coef", "Order", "ECTS", "H. tot", "Opt", "Libre"]
+        headers = ["Code", "Nom", "Bloc", "Pond. (ECTS)", "Ordre", "ECTS", "H. tot", "Opt", "Libre"]
         self.maquette_courses_table.setColumnCount(len(headers))
         self.maquette_courses_table.setHorizontalHeaderLabels(headers)
         self.maquette_courses_table.setRowCount(len(rows))
         for i, r in enumerate(rows):
+            pub = course_public_code(dict(r), academic_year=self.default_academic_year)
             vals = [
-                r["code"],
+                pub or r.get("code", ""),
                 r["name"],
                 r.get("block_name") or "",
-                r["global_coefficient"],
+                r["ects"] if float(r.get("ects") or 0) > 0 else r["global_coefficient"],
                 r["display_order"],
                 r["ects"],
                 r.get("hours_total") if r.get("hours_total") is not None else "",
@@ -207,6 +214,8 @@ class MaquetteTab(QWidget):
 
     def add_maquette(self) -> None:
         dlg = TemplateDialog(self)
+        if self.default_academic_year:
+            dlg.academic_year.setText(self.default_academic_year)
         if dlg.exec():
             try:
                 self.repo.add_template(
@@ -591,6 +600,7 @@ class MaquetteTab(QWidget):
                     rows = enrich_maquette_rows_mne_codes(
                         result.rows, level=level, track=track
                     )
+                    rows = apply_secretariat_course_codes(rows, academic_year=academic_year)
                     c, u, s, e = import_maquette_row_dicts(
                         self.repo,
                         rows,
@@ -656,9 +666,16 @@ class MaquetteTab(QWidget):
             tpl_for_attach = int(new_id)
             attach = True
 
+        tpl_meta = self.repo.get_template(int(tpl_for_attach)) if tpl_for_attach else {}
+        level = str((tpl_meta or {}).get("level") or "")
+        track = str((tpl_meta or {}).get("track") or "")
+        ay = str((tpl_meta or {}).get("academic_year") or self.default_academic_year or "").strip()
+        rows = enrich_maquette_rows_mne_codes(result.rows, level=level, track=track)
+        rows = apply_secretariat_course_codes(rows, academic_year=ay)
+
         created, updated, skipped, errors = import_maquette_row_dicts(
             self.repo,
-            result.rows,
+            rows,
             update_existing=update_existing,
             template_id=tpl_for_attach,
             attach_to_template=attach,
@@ -709,16 +726,110 @@ class MaquetteTab(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "Export", str(exc))
 
+    def apply_official_maquettes(self) -> None:
+        ay = (self.default_academic_year or "2026-2027").strip()
+        reply = QMessageBox.question(
+            self,
+            "Maquettes officielles",
+            (
+                f"Réaligner <b>toutes</b> les maquettes du millésime <b>{ay}</b> sur les "
+                "documents officiels ?\n\n"
+                "• M1 P / M1 C : OF PR1162 (fichier mod)\n"
+                "• M2 : erratum PDF (tronc commun + DWM) + OF PR1163 (NPD, NPO, NFC, NRPE)\n\n"
+                "Les inscriptions et notes existantes sont conservées."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            summary = self.repo.apply_official_accreditation_maquettes(academic_year=ay)
+            self.refresh()
+            for cb in self.refresh_callbacks:
+                cb()
+            lines = [f"Millésime {ay}"]
+            for tr, info in (summary.get("m1") or {}).get("tracks", {}).items():
+                lines.append(f"M1 {tr} : {info.get('rows')} UE, {info.get('total_ects'):.0f} ECTS")
+            for tr, info in (summary.get("m2") or {}).get("tracks", {}).items():
+                if tr == "DWM":
+                    lines.append(
+                        f"M2 DWM (PDF) : {info.get('template_rows')} UE, "
+                        f"{info.get('total_ects'):.0f} ECTS"
+                    )
+                else:
+                    lines.append(
+                        f"M2 {tr} : {info.get('rows')} UE, {info.get('total_ects'):.0f} ECTS"
+                    )
+            QMessageBox.information(self, "Maquettes officielles", "\n".join(lines))
+        except Exception as exc:
+            QMessageBox.critical(self, "Maquettes officielles", str(exc))
+
+    def repair_millésime_course_codes(self) -> None:
+        ay = self.default_academic_year
+        if not ay:
+            QMessageBox.information(
+                self,
+                "Réparation nomenclature",
+                "Ouvrez d'abord un millésime depuis l'écran d'accueil.",
+            )
+            return
+        from ..services.academic_years import millésime_uses_secretariat_course_codes
+
+        secretariat = millésime_uses_secretariat_course_codes(ay)
+        if secretariat:
+            msg = (
+                f"Pour le millésime <b>{ay}</b>, appliquer la nomenclature secrétariat (S1-C/P/X) "
+                f"et isoler les fiches UE de celles des autres millésimes ?"
+            )
+            title = "Réparer codes secrétariat"
+        else:
+            msg = (
+                f"Pour le millésime <b>{ay}</b>, vérifier la nomenclature MNE (M1B1-…) "
+                f"et isoler les fiches UE partagées avec un autre millésime ?"
+            )
+            title = "Réparer nomenclature MNE"
+        reply = QMessageBox.question(
+            self,
+            title,
+            msg,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            stats = self.repo.ensure_millésime_course_integrity(ay)
+            self.refresh()
+            for cb in self.refresh_callbacks:
+                cb()
+            QMessageBox.information(
+                self,
+                "Réparation terminée",
+                f"Millésime {ay}\n"
+                f"- Fiches secrétariat créées : {stats['forked_secretariat']}\n"
+                f"- UE isolées (autre millésime) : {stats['isolated_courses']}\n"
+                f"- Rattachements maquette : {stats['relinked_placements']}\n"
+                f"- Champs MNE nettoyés : {stats['sanitized_mne_fields']}\n"
+                f"- Blocs maquette corrigés : {stats['fixed_block_labels']}\n"
+                f"- Stages M2 replacés (M1 → M2) : {stats['fixed_m2_internship_placements']}",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Erreur", str(exc))
+
     def add_ue_to_maquette(self) -> None:
         tid = self.current_template_id()
         if tid is None:
             QMessageBox.warning(self, "Maquette", "Sélectionnez une maquette.")
             return
-        courses = self.repo.list_courses()
+        if self.default_academic_year:
+            courses = self.repo.list_courses_for_academic_year(self.default_academic_year)
+        else:
+            courses = self.repo.list_courses()
         if not courses:
             QMessageBox.warning(self, "Maquette", "Aucun cours en base. Importez une maquette ou créez un cours dans l’onglet Cours.")
             return
-        dlg = AddCourseToTemplateDialog(courses, self)
+        dlg = AddCourseToTemplateDialog(courses, self, academic_year=self.default_academic_year)
         if dlg.exec():
             try:
                 self.repo.add_course_to_template(

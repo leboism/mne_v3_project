@@ -1,0 +1,51 @@
+Objet : Build Windows — MNE Grade Manager (correction Spyder)
+
+Bonjour,
+
+Petite précision sur l'archive envoyée : **Spyder ne permet pas d'« ouvrir un dossier »** comme VS Code ou Cursor — c'est normal, ce n'est pas un bug.
+
+Pour créer l'exécutable, le plus simple est d'utiliser **Anaconda Prompt** (ou PowerShell), pas Spyder.
+
+---
+
+## Procédure simplifiée
+
+**1.** Dézipper vers `C:\Dev\mne_v3_project` (ou autre chemin sans accents de préférence).
+
+**2.** Menu Démarrer → **Anaconda Prompt** (ou Miniconda3 Prompt) :
+
+```text
+conda create -n mne-build python=3.11 -y
+conda activate mne-build
+cd C:\Dev\mne_v3_project
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m pip install pyinstaller
+python -m mne_grade_manager
+```
+
+(La fenêtre MNE s'ouvre → la fermer.)
+
+**3.** Lancer le build :
+
+```text
+scripts\build_windows.bat
+```
+
+**4.** Résultat : `dist\MNEGradeManager\MNEGradeManager.exe`  
+→ me renvoyer un zip de **tout le dossier** `dist\MNEGradeManager\`.
+
+---
+
+## Si tu veux quand même utiliser Spyder (lecture du code)
+
+- En haut à droite de la console : icône **dossier** → sélectionner `C:\Dev\mne_v3_project`  
+  ou taper : `%cd C:\Dev\mne_v3_project`
+- **File → Open file** → `src\mne_grade_manager\main.py`
+- Ou : **Projects → New Project → Existing directory** → choisir le dossier du projet
+
+Le build (`pip`, PyInstaller) reste plus fiable depuis **Anaconda Prompt**.
+
+Guide complet dans l'archive : `docs\BUILD_WINDOWS.md`.
+
+Merci !

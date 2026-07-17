@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from ..core.institutions import PEDAGOGICAL_CONTRACT_CATEGORY, STUDENT_ATTACHMENT_CATEGORIES
 from ..services.attachments import abs_path_from_stored
+from .widgets import refresh_students_tab_ancestor
 
 if TYPE_CHECKING:
     from ..services.repository import Repository
@@ -126,6 +127,7 @@ class StudentFilesPanel(QWidget):
         if self.repo is not None and self.student_id is not None:
             try:
                 self.repo.set_pedagogical_contract_paper(int(self.student_id), checked)
+                refresh_students_tab_ancestor(self)
             except Exception as exc:
                 QMessageBox.critical(self, "Contrat pédagogique", str(exc))
 

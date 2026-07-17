@@ -4,7 +4,19 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QHBoxLayout, QMenu, QPushButton, QTableWidget, QTableWidgetItem, QToolButton
+from PySide6.QtWidgets import QHBoxLayout, QMenu, QPushButton, QTableWidget, QTableWidgetItem, QToolButton, QWidget
+
+
+def refresh_students_tab_ancestor(widget: QWidget | None) -> None:
+    """Rafraîchit l'onglet Étudiants parent (liste + bannière contrats)."""
+    w: QWidget | None = widget
+    while w is not None:
+        if hasattr(w, "refresh") and hasattr(w, "_students_raw"):
+            w.refresh()
+            for cb in getattr(w, "refresh_callbacks", []) or []:
+                cb()
+            return
+        w = w.parent()
 
 
 @dataclass

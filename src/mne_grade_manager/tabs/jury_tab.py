@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -34,13 +35,19 @@ from ..gui.jury_deliberation_dialog import JuryDeliberationDialog
 from ..gui.jury_roster_pick_dialog import JuryRosterCopyDialog, JuryRosterPickDialog
 from ..gui.widgets import make_actions_toolbar
 from ..services import terminology as T
-from ..services.jury_excel import parse_jury_members_workbook, write_jury_import_template
+from ..services.jury_scope import scope_example_help_text, suggest_pv_pdf_filename, suggest_scope_text
+from ..services.jury_excel import (
+    parse_jury_members_workbook,
+    write_jury_import_template,
+    write_jury_roster_workbook,
+)
 from ..services.jury_reports import (
     export_jury_pdf_bundle,
     write_grade_matrix_pdf,
     write_institutional_pv_pdf,
     write_pv_jury_pdf,
     write_transcript_pdf,
+    export_transcripts_batch,
 )
 
 
@@ -49,6 +56,13 @@ _KIND_TABS: tuple[tuple[str, str], ...] = (
     ("S2", "2ᵉ session"),
     ("FINAL", "Finale"),
 )
+
+_JURY_MEMBER_HEADERS = ["Président", "Nom", "Prénom", "Qualité", "Institution"]
+_JURY_COL_PRES = 0
+_JURY_COL_LAST = 1
+_JURY_COL_FIRST = 2
+_JURY_COL_TITLE = 3
+_JURY_COL_INST = 4
 
 
 def _parcours_roster_combo_label(
@@ -90,9 +104,11 @@ class _AddMemberDialog(QDialog):
 class DeliberationsTab(QWidget):
     """Compositions réutilisables du jury + délibérations (réunions) et exports PV."""
 
-    def __init__(self, repo):
+    def __init__(self, repo, *, default_academic_year: str = ""):
         super().__init__()
         self.repo = repo
+        self.default_academic_year = (default_academic_year or "").strip()
+        self._settings = QSettings("MNE", "MNEGradeManagerV3")
         self._session_lists: dict[str, QListWidget] = {}
         self._members_loading = False
         self._roster_loading = False
@@ -126,8 +142,9 @@ class DeliberationsTab(QWidget):
         comp_lay = QVBoxLayout(comp_tab)
         comp_hint = QLabel(
             "Une composition par parcours (maquette M1 P, M1 C, M2 NPD…), réutilisable sur plusieurs délibérations. "
+            "Cochez la colonne <b>Président</b> pour la personne qui préside le jury (affichée en tête des PV). "
             "Renseignez-la ici ; elle n'est créée qu'à la première saisie ou import. "
-            "Vous pouvez copier vers un autre parcours ou n'en importer que certains membres."
+            "Vous pouvez copier depuis un autre millésime ou parcours, ou n'en importer que certains membres."
         )
         comp_hint.setWordWrap(True)
         comp_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
@@ -145,21 +162,29 @@ class DeliberationsTab(QWidget):
         self.roster_heading.setStyleSheet("font-weight: bold;")
         comp_lay.addWidget(self.roster_heading)
         self.roster_members_table = QTableWidget()
-        self.roster_members_table.setColumnCount(4)
-        self.roster_members_table.setHorizontalHeaderLabels(["Nom", "Prénom", "Qualité", "Institution"])
+        self.roster_members_table.setColumnCount(len(_JURY_MEMBER_HEADERS))
+        self.roster_members_table.setHorizontalHeaderLabels(_JURY_MEMBER_HEADERS)
         self.roster_members_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.roster_members_table.horizontalHeader().setSectionResizeMode(
+            _JURY_COL_PRES, QHeaderView.ResizeMode.ResizeToContents
+        )
         self.roster_members_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.roster_members_table.cellChanged.connect(self._on_roster_member_cell_changed)
+        self.roster_members_table.itemChanged.connect(self._on_roster_member_item_changed)
         comp_lay.addWidget(self.roster_members_table, 1)
         roster_members_tb = make_actions_toolbar(
             self,
-            primary=[("Importer composition (Excel)…", self._import_roster_excel)],
+            primary=[
+                ("Exporter composition (Excel)…", self._export_roster_excel),
+                ("Importer composition (Excel)…", self._import_roster_excel),
+            ],
             menu_sections=[
                 [
                     ("Modèle d'import Excel…", self._export_roster_import_template),
                     ("+ Membre…", self._add_roster_member),
+                    ("Copier depuis une autre composition…", self._copy_roster_from_catalog),
                     ("Copier vers autre parcours…", self._copy_roster_to_track),
-                    ("Importer membres depuis autre parcours…", self._import_members_from_roster),
+                    ("Ajouter des membres depuis une autre composition…", self._import_members_from_roster),
                     ("Vider cette composition", self._clear_comp_roster),
                 ],
                 [("Retirer la sélection", self._delete_roster_member)],
@@ -223,11 +248,34 @@ class DeliberationsTab(QWidget):
         self.roster_combo.currentIndexChanged.connect(self._on_delib_roster_changed)
         meta_form.addRow("Jury :", self.roster_combo)
 
+        scope_box = QWidget()
+        scope_lay = QVBoxLayout(scope_box)
+        scope_lay.setContentsMargins(0, 0, 0, 0)
+        scope_lay.setSpacing(4)
         self.scope_edit = QLineEdit()
-        self.scope_edit.setPlaceholderText("Ex. Bloc 1 — 1ʳᵉ session, puis Blocs 2–3 S1…")
+        self.scope_edit.setPlaceholderText("Bloc 1 — S1")
         self.scope_edit.editingFinished.connect(self._save_session_meta)
         self.scope_edit.setEnabled(False)
-        meta_form.addRow("Périmètre :", self.scope_edit)
+        scope_lay.addWidget(self.scope_edit)
+        self.scope_example_label = QLabel("")
+        self.scope_example_label.setWordWrap(True)
+        self.scope_example_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        scope_lay.addWidget(self.scope_example_label)
+        meta_form.addRow("Périmètre :", scope_box)
+
+        self.session_notes_edit = QTextEdit()
+        self.session_notes_edit.setPlaceholderText(
+            "Commentaires généraux : décisions collectives, dérogations promo, verbatim PV…"
+        )
+        self.session_notes_edit.setMinimumHeight(64)
+        self.session_notes_edit.setMaximumHeight(120)
+        self.session_notes_edit.textChanged.connect(self._schedule_session_notes_save)
+        self.session_notes_edit.setEnabled(False)
+        meta_form.addRow("Commentaires :", self.session_notes_edit)
+        self._session_notes_timer = QTimer(self)
+        self._session_notes_timer.setSingleShot(True)
+        self._session_notes_timer.setInterval(800)
+        self._session_notes_timer.timeout.connect(self._save_session_notes_only)
         right_lay.addLayout(meta_form)
 
         members_box = QGroupBox(T.JURY_MEMBERS)
@@ -238,7 +286,10 @@ class DeliberationsTab(QWidget):
         mb.addWidget(self.members_hint)
         delib_members_tb = make_actions_toolbar(
             self,
-            primary=[("Importer composition (Excel)…", self._import_deliberation_composition)],
+            primary=[
+                ("Exporter composition (Excel)…", self._export_deliberation_composition_excel),
+                ("Importer composition (Excel)…", self._import_deliberation_composition),
+            ],
             menu_sections=[
                 [
                     ("Modèle d'import Excel…", self._export_roster_import_template),
@@ -248,16 +299,20 @@ class DeliberationsTab(QWidget):
             ],
         )
         mb.addLayout(delib_members_tb.layout)
-        self.add_member_btn = delib_members_tb.primary_buttons[0]
+        self.add_member_btn = delib_members_tb.menu_actions["+ Membre (ad hoc)…"]
         self.del_member_btn = delib_members_tb.menu_actions["Retirer la sélection"]
 
         self.members_table = QTableWidget()
-        self.members_table.setColumnCount(4)
-        self.members_table.setHorizontalHeaderLabels(["Nom", "Prénom", "Qualité", "Institution"])
+        self.members_table.setColumnCount(len(_JURY_MEMBER_HEADERS))
+        self.members_table.setHorizontalHeaderLabels(_JURY_MEMBER_HEADERS)
         self.members_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.members_table.horizontalHeader().setSectionResizeMode(
+            _JURY_COL_PRES, QHeaderView.ResizeMode.ResizeToContents
+        )
         self.members_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.members_table.setAlternatingRowColors(True)
         self.members_table.cellChanged.connect(self._on_member_cell_changed)
+        self.members_table.itemChanged.connect(self._on_member_member_item_changed)
         mb.addWidget(self.members_table, 1)
         right_lay.addWidget(members_box, 2)
 
@@ -268,6 +323,11 @@ class DeliberationsTab(QWidget):
         self.pdf_session_combo = QComboBox()
         self.pdf_session_combo.addItem("Session 1", "s1")
         self.pdf_session_combo.addItem("Session 2", "s2")
+        self.pdf_session_combo.addItem("Retenue (S2 si dispo.)", "mixed")
+        self.pdf_session_combo.setToolTip(
+            "Vue des notes pour la délibération interactive, les tableaux PDF et les PV.\n"
+            "N'influence pas le relevé / transcript institutionnel (toujours en vue retenue)."
+        )
         view_row.addWidget(self.pdf_session_combo)
         view_row.addStretch()
         pdf_lay.addLayout(view_row)
@@ -276,13 +336,20 @@ class DeliberationsTab(QWidget):
         tr_row.addWidget(QLabel("Relevé :"))
         self.student_combo = QComboBox()
         self.student_combo.setMinimumWidth(200)
+        self.student_combo.setToolTip(
+            "Étudiant pour « Exporter relevé (PDF) » — vue retenue S1/S2 par UE, "
+            "identique à l'onglet Résultats."
+        )
         tr_row.addWidget(self.student_combo, 1)
-        self.tr_session_combo = QComboBox()
-        self.tr_session_combo.addItem("S1", "s1")
-        self.tr_session_combo.addItem("S2", "s2")
-        tr_row.addWidget(self.tr_session_combo)
         tr_row.addStretch()
         pdf_lay.addLayout(tr_row)
+        pdf_notes_hint = QLabel(
+            "Relevé et transcripts : notes retenues (S2 par UE si une note S2 existe). "
+            "« Notes affichées » concerne seulement la délibération, les matrices et les PV."
+        )
+        pdf_notes_hint.setWordWrap(True)
+        pdf_notes_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        pdf_lay.addWidget(pdf_notes_hint)
         pdf_tb = make_actions_toolbar(
             self,
             primary=[
@@ -294,6 +361,19 @@ class DeliberationsTab(QWidget):
                 [(T.PV_BUTTON, self._export_institutional_pv)],
                 [("PV brouillon (détail)", self._export_pv)],
                 [("Exporter relevé (PDF)", self._export_transcript)],
+                [
+                    ("Générer transcripts (tous, sans e-mail)…", self._export_institutional_transcripts_batch),
+                ],
+                [("Appliquer progressions M2 / redoublement / diplômé…", self._apply_all_progressions)],
+                [
+                    (
+                        "Réinitialiser contrats pédagogiques M2 (passages antérieurs)…",
+                        self._reset_m2_pedagogical_contracts_batch,
+                    )
+                ],
+                [("Enregistrer toutes les décisions suggérées…", self._persist_all_final_outcomes)],
+                [("État de clôture du jury final…", self._show_final_jury_closure)],
+                [("E-mails jury → étudiants (par étudiant)…", self._open_jury_student_emails)],
             ],
         )
         pdf_lay.addLayout(pdf_tb.layout)
@@ -312,7 +392,9 @@ class DeliberationsTab(QWidget):
             "saisir les points jury et les envois S2 avec recalcul des moyennes en direct. "
             "Le PV institutionnel reprend membres, points, S2 et décisions (passage M2, redoublement…). "
             "Jury final : propositions redoublement / refus de redoublement (ou passage M2) selon les règles ; "
-            "le jury choisit et enregistre la décision."
+            "utilisez « Enregistrer toutes les décisions suggérées » pour les cas non problématiques non parcourus, "
+            "puis « État de clôture du jury final » avant le PV. La clôture administrative (passage M2, redoublement, "
+            "diplômé) se fait via « Appliquer progressions… »."
         )
         delib_hint.setWordWrap(True)
         delib_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
@@ -378,6 +460,7 @@ class DeliberationsTab(QWidget):
         self.session_label_edit.setEnabled(on)
         self.roster_combo.setEnabled(on)
         self.scope_edit.setEnabled(on)
+        self.session_notes_edit.setEnabled(on)
         self.add_member_btn.setEnabled(on)
         self.del_member_btn.setEnabled(on)
         self.members_table.setEnabled(on)
@@ -386,6 +469,7 @@ class DeliberationsTab(QWidget):
             self.session_heading.setText(T.DELIBERATION_SELECT)
             self.session_label_edit.clear()
             self.scope_edit.clear()
+            self.session_notes_edit.clear()
             self.roster_combo.blockSignals(True)
             self.roster_combo.clear()
             self.roster_combo.addItem("—", None)
@@ -399,7 +483,7 @@ class DeliberationsTab(QWidget):
         try:
             prev = self.template_combo.currentData()
             self.template_combo.clear()
-            for t in self.repo.list_templates():
+            for t in self.repo.list_templates(academic_year=self.default_academic_year or None):
                 lv, tr = (t.get("level") or "").strip(), (t.get("track") or "").strip()
                 suffix = f" — {lv} {tr}" if lv or tr else ""
                 self.template_combo.addItem(f"{t['name']} [{t['academic_year']}]{suffix}", int(t["id"]))
@@ -536,6 +620,18 @@ class DeliberationsTab(QWidget):
         self._set_roster_detail_enabled(True)
         self._load_roster_members_table()
 
+    @staticmethod
+    def _make_president_item(*, member_id: int, checked: bool, editable: bool) -> QTableWidgetItem:
+        it = QTableWidgetItem()
+        flags = Qt.ItemFlag.ItemIsUserCheckable
+        if editable:
+            flags |= Qt.ItemFlag.ItemIsEnabled
+        it.setFlags(flags)
+        it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        it.setData(Qt.ItemDataRole.UserRole, member_id)
+        it.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+        return it
+
     def _load_roster_members_table(self) -> None:
         rid = self._current_comp_roster_id()
         self._roster_loading = True
@@ -548,7 +644,16 @@ class DeliberationsTab(QWidget):
             self.roster_members_table.setRowCount(len(rows))
             for i, m in enumerate(rows):
                 mid = int(m["id"])
-                for j, key in enumerate(("last_name", "first_name", "title", "institution")):
+                pres = self._make_president_item(
+                    member_id=mid,
+                    checked=bool(int(m.get("is_president") or 0)),
+                    editable=True,
+                )
+                self.roster_members_table.setItem(i, _JURY_COL_PRES, pres)
+                for j, key in enumerate(
+                    ("last_name", "first_name", "title", "institution"),
+                    start=_JURY_COL_LAST,
+                ):
                     it = QTableWidgetItem(str(m.get(key) or ""))
                     it.setData(Qt.ItemDataRole.UserRole, mid)
                     it.setFlags(it.flags() | Qt.ItemFlag.ItemIsEditable)
@@ -579,31 +684,85 @@ class DeliberationsTab(QWidget):
         self._populate_delib_roster_combo()
 
     def _roster_catalog_filters(self) -> tuple[str, str]:
-        tpl = self._current_template_meta() or {}
-        ay = str(tpl.get("academic_year") or "").strip()
+        """Filtre catalogue : tous les millésimes ; niveau = parcours sélectionné (M1/M2)."""
+        tid = self._comp_template_id()
+        if tid is not None:
+            tpl = self.repo.get_template(int(tid)) or {}
+        else:
+            tpl = self._current_template_meta() or {}
         lv = str(tpl.get("level") or "").strip().upper()
-        return ay, lv
+        return "", lv
 
     def _pick_source_roster(self, *, exclude_current: bool) -> int | None:
-        ay, lv = self._roster_catalog_filters()
+        _ay, lv = self._roster_catalog_filters()
         ex = self._current_comp_roster_id() if exclude_current else None
         catalog = self.repo.list_jury_rosters_catalog(
-            academic_year=ay,
+            academic_year=_ay,
             level=lv,
             exclude_roster_id=ex,
+            only_with_members=True,
         )
         if not catalog:
             QMessageBox.information(
                 self,
                 "Compositions",
-                "Aucune autre composition trouvée pour ce millésime et ce niveau.\n"
-                "Créez-en une sur un autre parcours (changez de maquette en haut).",
+                "Aucune composition avec des membres trouvée pour ce niveau "
+                "(tous millésimes confondus).\n\n"
+                "Renseignez d'abord un jury sur un autre parcours ou une autre année, "
+                "ou importez un fichier Excel.",
             )
             return None
         dlg = JuryRosterPickDialog(catalog, title="Choisir une composition source", parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted or dlg.selected_roster_id is None:
             return None
         return int(dlg.selected_roster_id)
+
+    def _copy_roster_from_catalog(self) -> None:
+        """Remplace la composition du parcours courant par une autre (autre millésime ou parcours)."""
+        tgt_tid = self._comp_template_id()
+        if tgt_tid is None:
+            QMessageBox.information(
+                self,
+                "Copier",
+                "Sélectionnez le parcours de destination (millésime ouvert en haut de l'écran).",
+            )
+            return
+        src_id = self._pick_source_roster(exclude_current=True)
+        if src_id is None:
+            return
+        src = self.repo.get_jury_roster(int(src_id)) or {}
+        src_tpl = self.repo.get_template(int(src["template_id"])) or {}
+        tgt_tpl = self.repo.get_template(int(tgt_tid)) or {}
+        n = len(self.repo.list_jury_roster_members(int(src_id)))
+        src_lab = (
+            f"{src_tpl.get('level')} {src_tpl.get('track')} — {src_tpl.get('academic_year')}"
+        )
+        tgt_lab = (
+            f"{tgt_tpl.get('level')} {tgt_tpl.get('track')} — {tgt_tpl.get('academic_year')}"
+        )
+        reply = QMessageBox.question(
+            self,
+            "Copier la composition",
+            f"Remplacer la composition de\n  {tgt_lab}\npar celle de\n  {src_lab}\n\n"
+            f"{n} membre(s) seront recopiés. Continue ?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.repo.copy_jury_roster_to_template(int(src_id), int(tgt_tid))
+        except Exception as exc:
+            QMessageBox.critical(self, "Erreur", str(exc))
+            return
+        self._load_roster_members_table()
+        self._rebuild_comp_parcours_combo()
+        self._populate_delib_roster_combo()
+        QMessageBox.information(
+            self,
+            "Copie effectuée",
+            f"Composition copiée ({n} membre(s)).",
+        )
 
     def _copy_roster_to_track(self) -> None:
         src_id = self._current_comp_roster_id()
@@ -699,6 +858,129 @@ class DeliberationsTab(QWidget):
             )
         except Exception as exc:
             QMessageBox.critical(self, "Erreur", str(exc))
+
+    def _roster_export_default_path(self, *, prefix: str = "composition_jury") -> str:
+        tid = self.comp_parcours_combo.currentData()
+        tpl = self.repo.get_template(int(tid)) if tid is not None else {}
+        ay = str(tpl.get("academic_year") or self.default_academic_year or "jury").strip()
+        lv = str(tpl.get("level") or "").strip()
+        tr = str(tpl.get("track") or "").strip()
+        bits = [prefix, ay.replace("/", "-"), f"{lv}{tr}".strip()]
+        name = "_".join(b for b in bits if b) + ".xlsx"
+        return str(Path.home() / name)
+
+    def _export_members_excel(
+        self,
+        members: list[dict[str, str]],
+        *,
+        dialog_title: str,
+        default_path: str,
+        title: str = "",
+        academic_year: str = "",
+        empty_message: str,
+    ) -> None:
+        if not members:
+            QMessageBox.information(self, "Export", empty_message)
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            dialog_title,
+            default_path,
+            "Excel (*.xlsx)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            write_jury_roster_workbook(
+                members,
+                path,
+                title=title,
+                academic_year=academic_year,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "Export terminé",
+            f"{len(members)} membre(s) exporté(s) :\n{path}",
+        )
+
+    def _export_roster_excel(self) -> None:
+        rid = self._current_comp_roster_id()
+        if rid is None:
+            QMessageBox.information(
+                self,
+                "Export",
+                "Sélectionnez un parcours pour exporter sa composition.",
+            )
+            return
+        members = [
+            {
+                "last_name": str(m.get("last_name") or ""),
+                "first_name": str(m.get("first_name") or ""),
+                "title": str(m.get("title") or ""),
+                "institution": str(m.get("institution") or ""),
+                "is_president": int(m.get("is_president") or 0),
+            }
+            for m in self.repo.list_jury_roster_members(rid)
+        ]
+        roster = self.repo.get_jury_roster(rid) or {}
+        tpl = self.repo.get_template(int(roster.get("template_id") or 0)) or {}
+        lv = str(tpl.get("level") or "").strip().upper()
+        tr = str(tpl.get("track") or "").strip().upper()
+        title = f"{lv} {track_label(lv, tr)} — {str(roster.get('name') or 'Composition')}".strip()
+        self._export_members_excel(
+            members,
+            dialog_title="Exporter la composition du jury",
+            default_path=self._roster_export_default_path(),
+            title=title,
+            academic_year=str(tpl.get("academic_year") or self.default_academic_year or ""),
+            empty_message="Cette composition ne contient aucun membre à exporter.",
+        )
+
+    def _export_deliberation_composition_excel(self) -> None:
+        jsid = self._current_jury_session_id()
+        tid = self._tid()
+        if jsid is None or tid is None:
+            QMessageBox.information(
+                self,
+                "Export",
+                "Sélectionnez une délibération pour exporter sa composition.",
+            )
+            return
+        members = [
+            {
+                "last_name": str(m.get("last_name") or ""),
+                "first_name": str(m.get("first_name") or ""),
+                "title": str(m.get("title") or ""),
+                "institution": str(m.get("institution") or ""),
+                "is_president": int(m.get("is_president") or 0),
+            }
+            for m in self.repo.list_jury_members_for_deliberation(jsid)
+        ]
+        sess = self.repo.get_jury_session(jsid) or {}
+        tpl = self.repo.get_template(tid) or {}
+        lv = str(tpl.get("level") or "").strip().upper()
+        tr = str(tpl.get("track") or "").strip().upper()
+        label = str(sess.get("label") or T.DELIBERATION).strip()
+        title = f"{lv} {track_label(lv, tr)} — {label}".strip()
+        default = str(
+            Path.home()
+            / f"composition_jury_{tpl.get('academic_year', 'jury')}_{lv}{tr}_{label[:24]}.xlsx".replace(
+                " ", "_"
+            )
+        )
+        self._export_members_excel(
+            members,
+            dialog_title="Exporter la composition de la délibération",
+            default_path=default,
+            title=title,
+            academic_year=str(tpl.get("academic_year") or self.default_academic_year or ""),
+            empty_message="Aucun membre du jury à exporter pour cette délibération.",
+        )
 
     def _pick_jury_excel_file(self) -> str | None:
         path, _ = QFileDialog.getOpenFileName(
@@ -855,28 +1137,43 @@ class DeliberationsTab(QWidget):
         r = self.roster_members_table.currentRow()
         if r < 0:
             return None
-        it = self.roster_members_table.item(r, 0)
+        it = self.roster_members_table.item(r, _JURY_COL_LAST)
         if it is None:
             return None
         d = it.data(Qt.ItemDataRole.UserRole)
         return int(d) if d is not None else None
 
-    def _on_roster_member_cell_changed(self, row: int, col: int) -> None:
-        if self._roster_loading:
+    def _on_roster_member_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._roster_loading or item.column() != _JURY_COL_PRES:
             return
-        it = self.roster_members_table.item(row, 0)
+        rid = self._current_comp_roster_id()
+        mid = item.data(Qt.ItemDataRole.UserRole)
+        if rid is None or mid is None:
+            return
+        try:
+            if item.checkState() == Qt.CheckState.Checked:
+                self.repo.set_jury_roster_president(int(rid), int(mid))
+            else:
+                self.repo.clear_jury_roster_president(int(rid))
+        except Exception as exc:
+            QMessageBox.warning(self, "Président du jury", str(exc))
+        self._load_roster_members_table()
+
+    def _on_roster_member_cell_changed(self, row: int, col: int) -> None:
+        if self._roster_loading or col < _JURY_COL_LAST:
+            return
+        it = self.roster_members_table.item(row, _JURY_COL_LAST)
         if it is None:
             return
         mid = it.data(Qt.ItemDataRole.UserRole)
         if mid is None:
             return
+        keys = ("last_name", "first_name", "title", "institution")
+        key = keys[col - _JURY_COL_LAST]
         try:
             self.repo.update_jury_roster_member(
                 int(mid),
-                last_name=self.roster_members_table.item(row, 0).text() if self.roster_members_table.item(row, 0) else "",
-                first_name=self.roster_members_table.item(row, 1).text() if self.roster_members_table.item(row, 1) else "",
-                title=self.roster_members_table.item(row, 2).text() if self.roster_members_table.item(row, 2) else "",
-                institution=self.roster_members_table.item(row, 3).text() if self.roster_members_table.item(row, 3) else "",
+                **{key: self.roster_members_table.item(row, col).text()},
             )
         except Exception as exc:
             QMessageBox.warning(self, "Enregistrement", str(exc))
@@ -939,7 +1236,18 @@ class DeliberationsTab(QWidget):
                 self.roster_combo.setCurrentIndex(self.roster_combo.count() - 1)
         self.roster_combo.blockSignals(False)
 
+    def _sync_pdf_session_combo(self, session_kind: str | None = None) -> None:
+        kind = str(session_kind or self._active_kind() or "S1").strip().upper()
+        want = {"S1": "s1", "S2": "s2", "FINAL": "mixed"}.get(kind, "s1")
+        for i in range(self.pdf_session_combo.count()):
+            if str(self.pdf_session_combo.itemData(i) or "") == want:
+                self.pdf_session_combo.blockSignals(True)
+                self.pdf_session_combo.setCurrentIndex(i)
+                self.pdf_session_combo.blockSignals(False)
+                return
+
     def _on_kind_tab_changed(self, _idx: int) -> None:
+        self._sync_pdf_session_combo()
         self._on_session_list_changed()
 
     def _refresh_all_session_lists(self) -> None:
@@ -998,8 +1306,10 @@ class DeliberationsTab(QWidget):
         if jsid is None:
             self.members_table.setRowCount(0)
             self._set_detail_enabled(False)
+            self.scope_example_label.setText("")
             return
         sess = self.repo.get_jury_session(jsid) or {}
+        self._update_scope_example(sess)
         kind_lab = next((t for c, t in _KIND_TABS if c == str(sess.get("session_kind"))), "")
         self.session_heading.setText(f"{kind_lab} — {T.DELIBERATION.lower()} #{jsid}")
         self.session_label_edit.blockSignals(True)
@@ -1008,9 +1318,42 @@ class DeliberationsTab(QWidget):
         self.scope_edit.blockSignals(True)
         self.scope_edit.setText(str(sess.get("scope_text") or ""))
         self.scope_edit.blockSignals(False)
+        self.session_notes_edit.blockSignals(True)
+        self.session_notes_edit.setPlainText(str(sess.get("notes") or ""))
+        self.session_notes_edit.blockSignals(False)
+        self._sync_pdf_session_combo(str(sess.get("session_kind") or ""))
         self._set_detail_enabled(True)
         self._populate_delib_roster_combo()
         self._load_members_table()
+
+    def _s1_session_ordinal(self, template_id: int, jury_session_id: int, session_kind: str) -> int:
+        kind = str(session_kind or "S1").strip().upper()
+        ordered = [
+            s
+            for s in self.repo.list_jury_sessions(int(template_id))
+            if str(s.get("session_kind") or "").strip().upper() == kind
+        ]
+        ordered.sort(key=lambda s: (int(s.get("display_order") or 0), int(s["id"])))
+        for i, s in enumerate(ordered):
+            if int(s["id"]) == int(jury_session_id):
+                return i
+        return len(ordered)
+
+    def _update_scope_example(self, sess: dict) -> None:
+        kind = str(sess.get("session_kind") or "S1")
+        tid = self._tid()
+        ordinal = 0
+        if tid is not None:
+            ordinal = self._s1_session_ordinal(tid, int(sess["id"]), kind)
+        suggested = suggest_scope_text(kind, ordinal=ordinal)
+        self.scope_edit.setPlaceholderText(suggested)
+        self.scope_example_label.setText(
+            scope_example_help_text(
+                kind,
+                suggested=suggested,
+                current=str(sess.get("scope_text") or "").strip(),
+            )
+        )
 
     def _save_session_meta(self) -> None:
         jsid = self._current_jury_session_id()
@@ -1018,12 +1361,31 @@ class DeliberationsTab(QWidget):
             return
         label = self.session_label_edit.text().strip()
         scope = self.scope_edit.text().strip()
+        notes = self.session_notes_edit.toPlainText()
         try:
-            self.repo.update_jury_session(jsid, label=label, scope_text=scope)
+            self.repo.update_jury_session(jsid, label=label, scope_text=scope, notes=notes)
         except Exception as exc:
             QMessageBox.critical(self, "Erreur", str(exc))
             return
         self._refresh_all_session_lists()
+        sess = self.repo.get_jury_session(jsid) or {}
+        self._update_scope_example(sess)
+
+    def _schedule_session_notes_save(self) -> None:
+        if self._current_jury_session_id() is None:
+            return
+        self._session_notes_timer.start()
+
+    def _save_session_notes_only(self) -> None:
+        jsid = self._current_jury_session_id()
+        if jsid is None:
+            return
+        try:
+            self.repo.update_jury_session(
+                jsid, notes=self.session_notes_edit.toPlainText()
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Commentaires", str(exc))
 
     def _on_delib_roster_changed(self) -> None:
         jsid = self._current_jury_session_id()
@@ -1062,7 +1424,8 @@ class DeliberationsTab(QWidget):
             strk = str(tpl_src.get("track") or "").strip().upper()
             src = f"{slv} {track_label(slv, strk)}".strip()
             self.members_hint.setText(
-                f"Composition « {rname} » ({src}) — modifiable dans l'onglet Compositions."
+                f"Composition « {rname} » ({src}) — modifiable dans l'onglet Compositions "
+                f"(colonne Président)."
             )
         else:
             self.members_hint.setText(
@@ -1080,7 +1443,17 @@ class DeliberationsTab(QWidget):
             for i, m in enumerate(rows):
                 mid = m.get("id")
                 editable = mid is not None and not uses_roster
-                for j, key in enumerate(("last_name", "first_name", "title", "institution")):
+                if mid is not None:
+                    pres = self._make_president_item(
+                        member_id=int(mid),
+                        checked=bool(int(m.get("is_president") or 0)),
+                        editable=editable,
+                    )
+                    self.members_table.setItem(i, _JURY_COL_PRES, pres)
+                for j, key in enumerate(
+                    ("last_name", "first_name", "title", "institution"),
+                    start=_JURY_COL_LAST,
+                ):
                     it = QTableWidgetItem(str(m.get(key) or ""))
                     if mid is not None:
                         it.setData(Qt.ItemDataRole.UserRole, int(mid))
@@ -1103,7 +1476,18 @@ class DeliberationsTab(QWidget):
         scope, ok2 = QInputDialog.getText(
             self,
             T.DELIBERATION_NEW,
-            "Périmètre de la délibération (optionnel, ex. Bloc 1 — S1) :",
+            "Périmètre de la délibération (recommandé — filtre le PV) :",
+            QLineEdit.EchoMode.Normal,
+            suggest_scope_text(
+                kind,
+                ordinal=len(
+                    [
+                        s
+                        for s in self.repo.list_jury_sessions(tid)
+                        if str(s.get("session_kind") or "") == kind
+                    ]
+                ),
+            ),
         )
         if not ok2:
             return
@@ -1187,28 +1571,43 @@ class DeliberationsTab(QWidget):
         r = self.members_table.currentRow()
         if r < 0:
             return None
-        it = self.members_table.item(r, 0)
+        it = self.members_table.item(r, _JURY_COL_LAST)
         if it is None:
             return None
         d = it.data(Qt.ItemDataRole.UserRole)
         return int(d) if d is not None else None
 
-    def _on_member_cell_changed(self, row: int, col: int) -> None:
-        if self._members_loading or self._delib_uses_roster():
+    def _on_member_member_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._members_loading or self._delib_uses_roster() or item.column() != _JURY_COL_PRES:
             return
-        it = self.members_table.item(row, 0)
+        jsid = self._current_jury_session_id()
+        mid = item.data(Qt.ItemDataRole.UserRole)
+        if jsid is None or mid is None:
+            return
+        try:
+            if item.checkState() == Qt.CheckState.Checked:
+                self.repo.set_jury_session_president(int(jsid), int(mid))
+            else:
+                self.repo.clear_jury_session_president(int(jsid))
+        except Exception as exc:
+            QMessageBox.warning(self, "Président du jury", str(exc))
+        self._load_members_table()
+
+    def _on_member_cell_changed(self, row: int, col: int) -> None:
+        if self._members_loading or self._delib_uses_roster() or col < _JURY_COL_LAST:
+            return
+        it = self.members_table.item(row, _JURY_COL_LAST)
         if it is None:
             return
         mid = it.data(Qt.ItemDataRole.UserRole)
         if mid is None:
             return
+        keys = ("last_name", "first_name", "title", "institution")
+        key = keys[col - _JURY_COL_LAST]
         try:
             self.repo.update_jury_member(
                 int(mid),
-                last_name=self.members_table.item(row, 0).text() if self.members_table.item(row, 0) else "",
-                first_name=self.members_table.item(row, 1).text() if self.members_table.item(row, 1) else "",
-                title=self.members_table.item(row, 2).text() if self.members_table.item(row, 2) else "",
-                institution=self.members_table.item(row, 3).text() if self.members_table.item(row, 3) else "",
+                **{key: self.members_table.item(row, col).text()},
             )
         except Exception as exc:
             QMessageBox.warning(self, "Enregistrement", str(exc))
@@ -1241,6 +1640,18 @@ class DeliberationsTab(QWidget):
             return False
         return True
 
+    def _last_pdf_dir(self) -> str:
+        val = str(self._settings.value("jury/last_pdf_dir", "") or "").strip()
+        if val and Path(val).exists():
+            return val
+        return str(Path.home())
+
+    def _remember_pdf_dir(self, path: str) -> None:
+        p = Path(str(path)).expanduser()
+        folder = p if p.is_dir() else p.parent
+        if folder.exists():
+            self._settings.setValue("jury/last_pdf_dir", str(folder))
+
     def _open_deliberation(self) -> None:
         tid = self._tid()
         if tid is None:
@@ -1259,6 +1670,254 @@ class DeliberationsTab(QWidget):
         )
         dlg.exec()
 
+    def _apply_all_progressions(self) -> None:
+        if self._active_kind() != "FINAL":
+            QMessageBox.information(
+                self,
+                T.DELIBERATIONS,
+                "Disponible pour le jury final uniquement (onglet « Finale »).",
+            )
+            return
+        tid = self._tid()
+        jsid = self._current_jury_session_id()
+        if tid is None or jsid is None:
+            QMessageBox.warning(self, T.DELIBERATIONS, T.MSG_SELECT_DELIBERATION)
+            return
+        tpl = self._current_template_meta() or {}
+        lv = str(tpl.get("level") or "").strip().upper()
+        if lv not in {"M1", "M2"}:
+            QMessageBox.information(
+                self,
+                T.DELIBERATIONS,
+                "L'application groupée concerne les maquettes M1 ou M2.",
+            )
+            return
+        from ..services.dates import suggest_next_academic_year
+
+        default_ay = suggest_next_academic_year(str(tpl.get("academic_year") or ""))
+        year, ok = QInputDialog.getText(
+            self,
+            "Millésime cible",
+            "Année universitaire pour les redoublements "
+            "(ignorée pour les clôtures M2 « Année validée ») :",
+            text=default_ay,
+        )
+        if not ok:
+            return
+        target_ay = str(year or "").strip()
+        if lv == "M1" and not target_ay:
+            QMessageBox.warning(self, T.DELIBERATIONS, "Millésime invalide.")
+            return
+        if lv == "M1":
+            body = (
+                "Appliquer sur les fiches étudiant toutes les décisions "
+                "« Admis en M2 » (parcours renseigné) et « Redoublement » "
+                f"pour le millésime {target_ay} ?\n\n"
+                "Les maquettes M2 / M1 du millésime cible doivent exister."
+            )
+        else:
+            body = (
+                "Appliquer sur les fiches étudiant toutes les décisions "
+                "« Année validée » (clôture diplômé) et « Redoublement » "
+                f"(millésime {target_ay or '—'}) ?"
+            )
+        reply = QMessageBox.question(
+            self,
+            T.DELIBERATIONS,
+            body,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        applied, errors = self.repo.apply_all_final_jury_progressions(
+            int(tid),
+            jury_session_id=int(jsid),
+            new_academic_year=target_ay,
+        )
+        msg = f"{applied} progression(s) appliquée(s)."
+        if errors:
+            preview = "\n".join(errors[:12])
+            if len(errors) > 12:
+                preview += f"\n… ({len(errors) - 12} autre(s))"
+            msg += f"\n\nAvertissements :\n{preview}"
+        QMessageBox.information(self, T.DELIBERATIONS, msg)
+
+    def _reset_m2_pedagogical_contracts_batch(self) -> None:
+        candidates = self.repo.list_m2_students_with_pedagogical_contract()
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "Contrats pédagogiques M2",
+                "Aucun étudiant en M2 n'a encore de contrat pédagogique enregistré.",
+            )
+            return
+        preview = "\n".join(
+            f"  • {str(s.get('last_name') or '').strip()} {str(s.get('first_name') or '').strip()}".strip()
+            for s in candidates[:15]
+        )
+        extra = ""
+        if len(candidates) > 15:
+            extra = f"\n  … et {len(candidates) - 15} autre(s)"
+        reply = QMessageBox.question(
+            self,
+            "Contrats pédagogiques M2",
+            (
+                f"{len(candidates)} étudiant(s) en M2 ont encore un contrat pédagogique "
+                "(probablement le contrat M1, distinct du contrat M2).\n\n"
+                "Le contrat sera effacé sur chaque fiche (PDF + version papier). "
+                "Un nouveau contrat M2 devra ensuite être déposé.\n\n"
+                f"{preview}{extra}\n\n"
+                "Confirmer la réinitialisation ?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        count, names = self.repo.reset_pedagogical_contracts_for_m2_students()
+        msg = f"{count} contrat(s) pédagogique(s) réinitialisé(s)."
+        if names:
+            lines = "\n".join(f"  • {n}" for n in names[:12])
+            if len(names) > 12:
+                lines += f"\n  … et {len(names) - 12} autre(s)"
+            msg += f"\n\n{lines}"
+        QMessageBox.information(self, "Contrats pédagogiques M2", msg)
+
+    def _persist_all_final_outcomes(self) -> None:
+        if self._active_kind() != "FINAL":
+            QMessageBox.information(
+                self,
+                T.DELIBERATIONS,
+                "Disponible pour le jury final uniquement (onglet « Finale »).",
+            )
+            return
+        tid = self._tid()
+        jsid = self._current_jury_session_id()
+        if tid is None or jsid is None:
+            QMessageBox.warning(self, T.DELIBERATIONS, T.MSG_SELECT_DELIBERATION)
+            return
+        reply = QMessageBox.question(
+            self,
+            T.DELIBERATIONS,
+            "Enregistrer la décision et la mention suggérées pour tous les étudiants "
+            "qui n'ont pas encore de décision enregistrée ?\n\n"
+            "Cela couvre notamment les cas non problématiques (admis M2) non ouverts "
+            "en délibération interactive. Les décisions déjà enregistrées ne sont pas modifiées.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        result = self.repo.persist_suggested_final_jury_outcomes(
+            int(tid), jury_session_id=int(jsid), view_session="mixed"
+        )
+        status = self.repo.get_final_jury_closure_status(
+            int(tid), jury_session_id=int(jsid), view_session="mixed"
+        )
+        msg = (
+            f"{result['saved']} décision(s) enregistrée(s), "
+            f"{result['skipped']} déjà présente(s) sur {result['total']} étudiant(s)."
+        )
+        if result.get("by_outcome"):
+            bits = ", ".join(
+                f"{k}: {v}" for k, v in sorted(result["by_outcome"].items())
+            )
+            msg += f"\n\nRépartition : {bits}"
+        if status.get("missing_outcome"):
+            msg += (
+                f"\n\nEncore sans décision : {len(status['missing_outcome'])} "
+                f"(vérifier les fiches)."
+            )
+        elif status.get("ready_for_pv"):
+            msg += "\n\n✓ Toutes les décisions sont enregistrées — PV et transcripts finaux possibles."
+        QMessageBox.information(self, T.DELIBERATIONS, msg)
+
+    def _show_final_jury_closure(self) -> None:
+        if self._active_kind() != "FINAL":
+            QMessageBox.information(
+                self,
+                T.DELIBERATIONS,
+                "Disponible pour le jury final uniquement (onglet « Finale »).",
+            )
+            return
+        tid = self._tid()
+        jsid = self._current_jury_session_id()
+        if tid is None or jsid is None:
+            QMessageBox.warning(self, T.DELIBERATIONS, T.MSG_SELECT_DELIBERATION)
+            return
+        st = self.repo.get_final_jury_closure_status(
+            int(tid), jury_session_id=int(jsid), view_session="mixed"
+        )
+        lines = [
+            f"Étudiants inscrits : {st['total']}",
+            f"Décisions enregistrées : {st['with_outcome']} / {st['total']}",
+        ]
+        if st["decisions_complete"]:
+            lines.append("✓ Décisions : complet")
+        else:
+            lines.append(f"✗ Sans décision ({len(st['missing_outcome'])}) :")
+            lines.extend(f"  • {n}" for n in st["missing_outcome"][:12])
+            if len(st["missing_outcome"]) > 12:
+                lines.append(f"  … et {len(st['missing_outcome']) - 12} autre(s)")
+        if st["missing_mention"]:
+            lines.append(f"⚠ Sans mention ({len(st['missing_mention'])})")
+        if st["pass_m2_no_track"]:
+            lines.append(f"⚠ Admis M2 sans parcours ({len(st['pass_m2_no_track'])}) :")
+            lines.extend(f"  • {n}" for n in st["pass_m2_no_track"][:8])
+        if st["progression_pending"]:
+            lines.append(
+                f"⚠ Progression non appliquée sur la fiche ({len(st['progression_pending'])}) — "
+                f"millésime cible {st.get('next_academic_year') or '—'} :"
+            )
+            lines.extend(f"  • {n}" for n in st["progression_pending"][:10])
+            if len(st["progression_pending"]) > 10:
+                lines.append(f"  … et {len(st['progression_pending']) - 10} autre(s)")
+        lines.append("")
+        if st["ready_for_progression"]:
+            lines.append("✓ Clôture administrative complète (décisions + fiches à jour).")
+        elif st["ready_for_pv"]:
+            lines.append(
+                "→ PV et transcripts finaux possibles. "
+                "Clôture administrative : « Appliquer progressions… » si besoin."
+            )
+        else:
+            lines.append(
+                "→ Enregistrez d'abord toutes les décisions (« Enregistrer toutes les décisions suggérées »)."
+            )
+        QMessageBox.information(self, "État de clôture du jury final", "\n".join(lines))
+
+    def _open_jury_student_emails(self) -> None:
+        tid = self._tid()
+        jsid = self._current_jury_session_id()
+        kind = self._active_kind()
+        if tid is None or jsid is None:
+            QMessageBox.warning(self, T.DELIBERATIONS, T.MSG_SELECT_DELIBERATION)
+            return
+        if kind == "FINAL" and not self.repo.has_final_jury_session(int(tid)):
+            QMessageBox.warning(
+                self,
+                "Transcript final",
+                "Créez d'abord une délibération « Finale » pour cette maquette.",
+            )
+            return
+        if not self._check_reportlab():
+            return
+        from ..gui.final_transcript_email_dialog import FinalTranscriptEmailDialog
+
+        dlg = FinalTranscriptEmailDialog(
+            self.repo,
+            template_id=int(tid),
+            jury_session_id=int(jsid),
+            session_kind=kind,
+            parent=self,
+        )
+        dlg.exec()
+
+    def _open_final_transcript_emails(self) -> None:
+        """Rétrocompatibilité."""
+        self._open_jury_student_emails()
+
     def _export_bundle(self) -> None:
         if not self._check_reportlab():
             return
@@ -1267,12 +1926,18 @@ class DeliberationsTab(QWidget):
             QMessageBox.warning(self, "PDF", "Cochez au moins un parcours.")
             return
         dest = QFileDialog.getExistingDirectory(
-            self, "Dossier de sortie des PDF jury", str(Path.home())
+            self, "Dossier de sortie des PDF jury", self._last_pdf_dir()
         )
         if not dest:
             return
+        self._remember_pdf_dir(dest)
         vs = str(self.pdf_session_combo.currentData() or "s1")
-        session_title = "First Session" if vs == "s1" else "Second Session"
+        if vs == "s1":
+            session_title = "First Session"
+        elif vs == "s2":
+            session_title = "Second Session"
+        else:
+            session_title = "Retained grades (S2 when available)"
         try:
             created = export_jury_pdf_bundle(
                 self.repo,
@@ -1290,6 +1955,18 @@ class DeliberationsTab(QWidget):
             f"{len(created)} fichier(s) créé(s) dans :\n{dest}",
         )
 
+    def _default_pv_path(self, *, draft: bool = False) -> str:
+        tpl = self._current_template_meta() or {}
+        jsid = self._current_jury_session_id()
+        sess = self.repo.get_jury_session(int(jsid)) if jsid is not None else {}
+        name = suggest_pv_pdf_filename(
+            track=str(tpl.get("track") or ""),
+            academic_year=str(tpl.get("academic_year") or ""),
+            session=sess or {},
+            draft=draft,
+        )
+        return str(Path(self._last_pdf_dir()) / name)
+
     def _export_institutional_pv(self) -> None:
         if not self._check_reportlab():
             return
@@ -1298,17 +1975,21 @@ class DeliberationsTab(QWidget):
         if tid is None or jsid is None:
             QMessageBox.warning(self, T.DELIBERATIONS, T.MSG_SELECT_DELIBERATION)
             return
-        tpl = self._current_template_meta() or {}
-        lv = str(tpl.get("level") or "M")
-        tr = str(tpl.get("track") or "")
-        ay = str(tpl.get("academic_year") or "").replace("-", "")
-        default = str(Path.home() / f"{tr} jury - {ay}.pdf")
+        default = self._default_pv_path(draft=False)
         path, _ = QFileDialog.getSaveFileName(self, T.PV_BUTTON, default, "PDF (*.pdf)")
         if not path:
             return
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
+        self._remember_pdf_dir(path)
         vs = str(self.pdf_session_combo.currentData() or "s1")
+        if self._active_kind() == "FINAL":
+            vs = "mixed"
+            persisted = self.repo.persist_suggested_final_jury_outcomes(
+                int(tid), jury_session_id=int(jsid), view_session=vs
+            )
+        else:
+            persisted = None
         try:
             write_institutional_pv_pdf(
                 self.repo,
@@ -1320,7 +2001,13 @@ class DeliberationsTab(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "PDF", str(exc))
             return
-        QMessageBox.information(self, "PDF", f"Fichier créé :\n{path}")
+        msg = f"Fichier créé :\n{path}"
+        if persisted and int(persisted.get("saved") or 0) > 0:
+            msg += (
+                f"\n\n{persisted['saved']} décision(s) enregistrée(s) automatiquement "
+                f"(cas non parcourus en délibération)."
+            )
+        QMessageBox.information(self, "PDF", msg)
 
     def _export_matrix(self) -> None:
         if not self._check_reportlab():
@@ -1329,12 +2016,16 @@ class DeliberationsTab(QWidget):
         if tid is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Tableau des notes", str(Path.home() / "tableau_notes.pdf"), "PDF (*.pdf)"
+            self,
+            "Tableau des notes",
+            str(Path(self._last_pdf_dir()) / "tableau_notes.pdf"),
+            "PDF (*.pdf)",
         )
         if not path:
             return
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
+        self._remember_pdf_dir(path)
         vs = str(self.pdf_session_combo.currentData() or "s1")
         try:
             write_grade_matrix_pdf(self.repo, template_id=tid, view_session=vs, path=path)
@@ -1352,12 +2043,13 @@ class DeliberationsTab(QWidget):
             QMessageBox.warning(self, T.DELIBERATIONS, T.MSG_SELECT_DELIBERATION)
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Procès-verbal", str(Path.home() / "PV_jury.pdf"), "PDF (*.pdf)"
+            self, "Procès-verbal", self._default_pv_path(draft=True), "PDF (*.pdf)"
         )
         if not path:
             return
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
+        self._remember_pdf_dir(path)
         vs = str(self.pdf_session_combo.currentData() or "s1")
         try:
             write_pv_jury_pdf(self.repo, template_id=tid, jury_session_id=jsid, view_session=vs, path=path)
@@ -1375,19 +2067,78 @@ class DeliberationsTab(QWidget):
             QMessageBox.warning(self, T.DELIBERATIONS, "Choisissez une maquette et un étudiant.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Relevé de notes", str(Path.home() / "releve.pdf"), "PDF (*.pdf)"
+            self, "Relevé de notes", str(Path(self._last_pdf_dir()) / "releve.pdf"), "PDF (*.pdf)"
         )
         if not path:
             return
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
-        vs = str(self.tr_session_combo.currentData() or "s1")
+        self._remember_pdf_dir(path)
         try:
-            write_transcript_pdf(self.repo, template_id=tid, student_id=int(sid), view_session=vs, path=path)
+            write_transcript_pdf(
+                self.repo,
+                template_id=tid,
+                student_id=int(sid),
+                view_session="mixed",
+                path=path,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "PDF", str(exc))
             return
         QMessageBox.information(self, "PDF", f"Fichier créé :\n{path}")
+
+    def _export_institutional_transcripts_batch(self) -> None:
+        """Génère des transcripts institutionnels pour tous les étudiants d'une maquette."""
+        if not self._check_reportlab():
+            return
+        tid = self._tid()
+        if tid is None:
+            QMessageBox.warning(self, T.DELIBERATIONS, "Sélectionnez une maquette.")
+            return
+
+        final = self._active_kind() == "FINAL"
+        if final and not self.repo.has_final_jury_session(int(tid)):
+            QMessageBox.warning(
+                self,
+                "Transcript final",
+                "Le transcript définitif nécessite une délibération « Finale » "
+                "pour cette maquette (PV & délibérations).",
+            )
+            return
+
+        enrolled = self.repo.list_students_for_template(int(tid))
+        sids = [int(s["id"]) for s in enrolled if str(s.get("id") or "").strip()]
+        if not sids:
+            QMessageBox.information(self, "Transcript", "Aucun étudiant inscrit sur cette maquette.")
+            return
+
+        dest = QFileDialog.getExistingDirectory(
+            self, "Dossier des transcripts", str(Path(self._last_pdf_dir()))
+        )
+        if not dest:
+            return
+
+        vs = str(self.pdf_session_combo.currentData() or "s1")
+        try:
+            created, errors = export_transcripts_batch(
+                self.repo,
+                template_id=int(tid),
+                student_ids=sids,
+                dest_dir=dest,
+                final=final,
+                view_session=vs,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "PDF", str(exc))
+            return
+
+        msg = f"{len(created)} transcript(s) créé(s) dans :\n{dest}"
+        if errors:
+            preview = "\n".join(f"• {name}: {err}" for name, err in errors[:8])
+            if len(errors) > 8:
+                preview += f"\n… et {len(errors) - 8} autre(s) erreur(s)"
+            msg += f"\n\n{len(errors)} échec(s) :\n{preview}"
+        QMessageBox.information(self, "PDF", msg)
 
 
 JuryTab = DeliberationsTab

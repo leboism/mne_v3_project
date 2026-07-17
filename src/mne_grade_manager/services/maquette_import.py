@@ -207,6 +207,40 @@ def enrich_maquette_rows_mne_codes(
     return out
 
 
+def apply_secretariat_course_codes(
+    rows: list[dict[str, Any]], *, academic_year: str = ""
+) -> list[dict[str, Any]]:
+    """Remplace les codes MNE (M1B1-…) par les codes secrétariat (S1-C-…) pour l'import maquette."""
+    from .academic_years import millésime_uses_secretariat_course_codes
+
+    if not millésime_uses_secretariat_course_codes(academic_year):
+        return [dict(row) for row in rows]
+    from ..core.mne_modules import (
+        is_legacy_semester_ue_code,
+        normalize_mne_module_code,
+        validate_mne_module_code,
+    )
+    from .timetable_legacy import map_mne_to_legacy_timetable_code
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        enriched = dict(row)
+        mne = str(enriched.get("mne_module_code") or "").strip()
+        code = str(enriched.get("code") or "").strip()
+        if not mne and validate_mne_module_code(code):
+            mne = normalize_mne_module_code(code)
+            enriched["mne_module_code"] = mne
+        if mne and not is_legacy_semester_ue_code(code):
+            raw_code = code
+            if raw_code.upper().startswith("EN") and not str(enriched.get("code_ip_paris") or "").strip():
+                enriched["code_ip_paris"] = raw_code
+            leg = map_mne_to_legacy_timetable_code(mne)
+            if leg:
+                enriched["code"] = leg
+        out.append(enriched)
+    return out
+
+
 @dataclass
 class MaquetteParseResult:
     sheet_names: list[str]
@@ -337,7 +371,18 @@ def infer_row_tracks(row: dict[str, Any], level: str) -> set[str]:
     name_up = _ascii_upper(name)
     text = f"{block} {name_up}"
 
+    if lv == "M1" and "NEUTRONIC" in name_up:
+        return {"P"}
+
     if lv == "M1":
+        if "INTERNSHIP" in name_up or (
+            "M2" in name_up and any(tok in name_up for tok in ("STAGE", "INTERN"))
+        ):
+            return set()
+        if "CHEMISTRY" in block and ("COURSE" in block or "BLOCK" in block):
+            return {"C"}
+        if "PHYSICS" in block and ("COURSE" in block or "BLOCK" in block):
+            return {"P"}
         if "SPECIALITE CHIMIE" in block or "SPECIALITE CHIMIE" in text:
             return {"C"}
         if "SPECIALITE PHYSIQUE" in block or "SPECIALITE PHYSIQUE" in text:
@@ -426,6 +471,7 @@ def plan_consolidated_of_import(
         if not rows:
             continue
         rows = enrich_maquette_rows_mne_codes(rows, level=level, track=track)
+        rows = apply_secretariat_course_codes(rows, academic_year=year)
         name = f"{year} — {level} {track}".strip(" —") if year else f"{level} {track}"
         plans.append(
             ConsolidatedTrackPlan(

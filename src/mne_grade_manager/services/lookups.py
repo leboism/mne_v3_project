@@ -63,8 +63,14 @@ def institutional_email_domain(enrollment_institution: str) -> str:
         return _INSTITUTION_TO_DOMAIN["Université Paris-Saclay"]
     if "ensta" in low:
         return _INSTITUTION_TO_DOMAIN["ENSTA Paris"]
-    if ("chimie" in low and "psl" in low) or "chimieparis" in compact:
-        return _INSTITUTION_TO_DOMAIN["Chimie Paris PSL"]
+    if "centralesupelec" in low or "centralesup" in compact:
+        return "centralesupelec.fr"
+    if "ponts" in low or "enpc" in compact:
+        return "enpc.fr"
+    if "cea" in low or "instn" in low:
+        return "cea.fr"
+    if ("chimie" in low and ("psl" in low or "paris" in low)) or "chimieparis" in compact:
+        return _INSTITUTION_TO_DOMAIN.get("Chimie Paris PSL", "chimieparistech.psl.eu")
     if (
         "ip paris" in low
         or "ip-paris" in low

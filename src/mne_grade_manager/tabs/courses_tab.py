@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.mne_modules import course_ue_code, is_legacy_semester_ue_code
+from ..services.timetable_legacy import course_public_code
 from ..gui.dialogs import AssessmentDialog, CourseDialog
 from ..gui.exam_convocation_dialog import ExamConvocationDialog
 from ..gui.internship_defense_planning_dialog import InternshipDefensePlanningDialog
@@ -26,7 +27,7 @@ def _course_fields_from_dialog(dlg: CourseDialog) -> dict:
     return dlg.fields_dict()
 
 
-def _course_list_label(c: dict) -> str:
+def _course_list_label(c: dict, *, academic_year: str = "") -> str:
     h = float(c.get("hours_total") or 0)
     ects = float(c.get("ects") or 0)
     extra = []
@@ -37,8 +38,11 @@ def _course_list_label(c: dict) -> str:
         extra.append(f"+:{other}")
     tail = f" | {' '.join(extra)}" if extra else ""
     mne = course_ue_code(c)
-    head = f"{mne} — {c['name']}" if mne else f"{c['code']} — {c['name']}"
-    if mne and c.get("code"):
+    pub = course_public_code(c, academic_year=academic_year)
+    head = f"{pub} — {c['name']}" if pub else f"{c['code']} — {c['name']}"
+    if mne and pub != mne:
+        head += f"  [{mne}]"
+    elif mne and c.get("code") and str(c.get("code")) != pub:
         head += f"  [Apogée {c['code']}]"
     return f"{head}  |  {ects:g} ECTS  |  {h:g} h{tail}"
 
@@ -65,15 +69,16 @@ class CoursesTab(QWidget):
         self.refresh_callbacks = refresh_callbacks or []
         self.default_academic_year = (default_academic_year or "").strip()
         layout = QVBoxLayout(self)
-        hint = QLabel(
-            "<b>Bibliothèque de cours (UE)</b> : fiches détaillées, heures, MCC, syllabus (PDF/Word), "
+        self.intro_label = QLabel(
+            "<b>Bibliothèque de cours (UE)</b> — fiches détaillées, heures, MCC, syllabus (PDF/Word), "
             "et assessments pour la saisie des notes. "
-            "L'arborescence suit la nomenclature MNE (M1/M2 → bloc → parcours). "
-            "Pour constituer un parcours (blocs, ordre, import Excel), utilisez l’onglet <b>Maquette</b>."
+            "L'arborescence suit la nomenclature secrétariat (S1-C/P/X) ou MNE selon le millésime. "
+            "Seules les UE des <b>maquettes du millésime ouvert</b> sont listées ici. "
+            "Pour constituer un parcours (blocs, ordre, import Excel), utilisez l'onglet <b>Maquette</b>."
         )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: palette(mid); font-size: 11px;")
-        layout.addWidget(hint)
+        self.intro_label.setWordWrap(True)
+        self.intro_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        layout.addWidget(self.intro_label)
         layout.addLayout(
             make_actions_toolbar(
                 self,
@@ -124,7 +129,7 @@ class CoursesTab(QWidget):
         return it
 
     def _leaf_item(self, parent: QTreeWidgetItem, course: dict) -> QTreeWidgetItem:
-        label = _course_list_label(course)
+        label = _course_list_label(course, academic_year=self.default_academic_year)
         it = QTreeWidgetItem(parent, [label])
         it.setData(0, Qt.ItemDataRole.UserRole, int(course["id"]))
         it.setToolTip(0, _course_tooltip(course, label))
@@ -193,7 +198,20 @@ class CoursesTab(QWidget):
         prev_id = self._current_course_id()
         expanded = self._collect_expanded_paths(self.course_tree.invisibleRootItem())
 
-        courses = self.repo.list_courses()
+        if self.default_academic_year:
+            courses = self.repo.list_courses_for_academic_year(self.default_academic_year)
+            self.intro_label.setText(
+                f"<b>Bibliothèque de cours (UE)</b> — millésime <b>{self.default_academic_year}</b> : "
+                f"<b>{len(courses)}</b> UE issue(s) des maquettes de cette année. "
+                "Fiches détaillées, MCC, syllabus, épreuves. "
+                "Pour modifier la composition d'un parcours, utilisez l'onglet <b>Maquette</b>."
+            )
+        else:
+            courses = self.repo.list_courses()
+        visible_ids = {int(c["id"]) for c in courses}
+        if prev_id is not None and prev_id not in visible_ids:
+            prev_id = None
+
         self.course_tree.blockSignals(True)
         self.course_tree.clear()
 
@@ -203,7 +221,9 @@ class CoursesTab(QWidget):
         track_labels: dict[tuple[str, str, str], str] = {}
 
         for c in courses:
-            lk, ll, bk, bl, tk, tl = course_tree_branch(c)
+            lk, ll, bk, bl, tk, tl = course_tree_branch(
+                c, academic_year=self.default_academic_year
+            )
             level_labels[lk] = ll
             block_labels[(lk, bk)] = bl
             track_labels[(lk, bk, tk)] = tl
@@ -261,7 +281,13 @@ class CoursesTab(QWidget):
                 if target_item is not None:
                     self.course_tree.setCurrentItem(target_item)
             elif not courses:
-                self.assessments_hint.setText("")
+                if self.default_academic_year:
+                    self.assessments_hint.setText(
+                        f"Aucune UE pour {self.default_academic_year} — importez ou créez une maquette "
+                        "dans l'onglet Maquette."
+                    )
+                else:
+                    self.assessments_hint.setText("")
                 fill_table(self.assessments_table, [], [])
         finally:
             self.course_tree.blockSignals(False)

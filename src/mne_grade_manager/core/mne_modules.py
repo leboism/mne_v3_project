@@ -152,23 +152,46 @@ M2_TRACK_TO_LETTER: dict[str, str] = {
 # Intitulés maquette UPSay (FR/EN) → code MNE officiel.
 _MAQUETTE_TITLE_ALIASES: dict[str, str] = {
     "thermodynamique": "M1B1-C-THER",
+    "thermodynamics": "M1B1-C-THER",
     "methodes mathematiques pour l ingenierie": "M1B1-C-MME",
+    "mathematics": "M1B1-C-MME",
+    "mathematical methods for engineering": "M1B1-C-MME",
     "interaction et detection des rayonnements ionisants": "M1B1-C-RADIOMAT",
+    "interaction of radiation with matter": "M1B1-C-RADIOMAT",
     "notions de physique nucleaire": "M1B1-C-NUCL",
+    "basic nuclear physics": "M1B1-C-NUCL",
     "technologies de production d energie": "M1B2-C-ENER",
+    "energy production technologies": "M1B2-C-ENER",
     "gestion de projet": "M1B2-C-PROJ",
+    "project management": "M1B2-C-PROJ",
     "economie de l energie": "M1B2-C-ECO",
+    "economics of energy": "M1B2-C-ECO",
+    "chemical engineering": "M1B1-C-CHEM",
     "notion de physique des reacteurs": "M1B2-C-REAC",
+    "basic reactor operation": "M1B2-C-REAC",
     "notion de neutronique": "M1B3-P-NEUT",
+    "basic neutronics": "M1B3-P-NEUT",
     "material science and mechanics": "M1B3-P-MATE",
     "ingenierie electrique": "M1B3-P-ELEC",
+    "electrical power engineering": "M1B3-P-ELEC",
     "notions de mecanique quantique": "M1B3-P-QUANT",
+    "basic quantum mechanics": "M1B3-P-QUANT",
     "mecanique des fluides et transferts thermiques": "M1B3-P-FLUI",
+    "fluid mechanics and heat transfer": "M1B3-P-FLUI",
     "detection appliquee a la physique": "M1B3-P-RADIOMAT",
+    "radiation detection and measurement": "M1B3-P-RADIOMAT",
     "controle des systemes dynamiques": "M1B3-P-CONT",
+    "control of dynamical systems": "M1B3-P-CONT",
     "mecanique des milieux continus": "M1B3-P-MECH",
+    "continuum mechanics": "M1B3-P-MECH",
+    "solution chemistry 1 speciation and process": "M1B3-X-SOL",
+    "radiolysis": "M1B3-X-RAD",
+    "chemistry of nuclear materials": "M1B3-X-NUMMATE",
+    "solution chemistry 2 separation chemistry": "M1B3-X-CHEM",
     "chimie analytique des elements radioactifs": "M1B3-X-ANCRE",
+    "analytical chemistry of radioactive elements": "M1B3-X-ANCRE",
     "spectroscopie atomique et moleculaire": "M1B3-X-SPECT",
+    "atomic and molecular spectroscopy": "M1B3-X-SPECT",
     "chimie dans le cycle electro nucleaire": "M1B3-X-CHEMNUCL",
     "pwr functional description": "M2B2-C-ENER",
     "systems and equipments": "M2B3-D-SYST",
@@ -197,26 +220,29 @@ for _alias, _code in _MAQUETTE_TITLE_ALIASES.items():
 
 def infer_maquette_block_number(block_name: str, level: str = "") -> int | None:
     """Déduit B1…B4 (ou B5 stage M2) depuis le libellé de bloc maquette."""
+    raw = str(block_name or "").strip()
+    if re.fullmatch(r"[1-5]", raw):
+        return int(raw)
     b = _ascii_upper(block_name)
-    m = re.search(r"BLOC\s*(\d)", b)
+    m = re.search(r"BL(?:OC|OCK)\s*(\d)", b)
     if m:
         return int(m.group(1))
-    if "TRONC COMMUN" in b and "BLOC 1" in b:
+    if "TRONC COMMUN" in b and re.search(r"BL(?:OC|OCK)\s*1", b):
         return 1
-    if "OUVERTURE" in b or ("TRONC COMMUN" in b and "BLOC 2" in b):
+    if "OUVERTURE" in b or ("TRONC COMMUN" in b and re.search(r"BL(?:OC|OCK)\s*2", b)):
         return 2
-    if "SPECIALITE" in b or "BLOC 3" in b:
+    if "SPECIALITE" in b or re.search(r"BL(?:OC|OCK)\s*3", b):
         return 3
     if "STAGE" in b or "INTERNSHIP" in b:
         return 4 if (level or "").upper() == "M1" else 5
     if (level or "").upper() == "M2":
-        if "COMMON" in b and "BLOC 1" in b:
+        if "COMMON" in b and re.search(r"BL(?:OC|OCK)\s*1", b):
             return 1
-        if "BLOC 2" in b:
+        if re.search(r"BL(?:OC|OCK)\s*2", b):
             return 2
-        if "BLOC 3" in b:
+        if re.search(r"BL(?:OC|OCK)\s*3", b):
             return 3
-        if "BLOC 4" in b:
+        if re.search(r"BL(?:OC|OCK)\s*4", b):
             return 4
     return None
 

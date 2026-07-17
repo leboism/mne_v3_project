@@ -4,10 +4,13 @@ from .core.database import Database
 from .services.repository import Repository
 from .gui.welcome_window import WelcomeWindow
 from .gui.main_window import MainWindow
+from .gui.platform import configure_before_qapplication, tune_application
 
 
 def main() -> int:
+    configure_before_qapplication()
     app = QApplication(sys.argv)
+    tune_application(app)
     app.setApplicationName("MNE Grade Manager")
     db = Database()
     repo = Repository(db)
@@ -19,10 +22,15 @@ def main() -> int:
     try:
         repo.cleanup_empty_orphan_jury_rosters()
         repo.repair_missing_s1_jury_sessions()
+        for tpl in repo.list_templates():
+            try:
+                repo.repair_jury_decision_session_links(int(tpl["id"]))
+            except Exception:
+                pass
     except Exception:
         pass
 
-    welcome = WelcomeWindow()
+    welcome = WelcomeWindow(db=db)
     main_window: MainWindow | None = None
 
     def on_year_selected(academic_year: str) -> None:

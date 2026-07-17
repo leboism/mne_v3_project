@@ -38,6 +38,20 @@ def status_blocks_validation(status: Any) -> bool:
     return normalize_grade_status(status) in (STATUS_ABJ, STATUS_DEF)
 
 
+def is_s2_reprise_assessment(
+    *,
+    session: int | None,
+    kind: str | None = None,
+    name: str | None = None,
+) -> bool:
+    """Épreuve S2 « reprise » (CC / CCTP reporté depuis S1) — pas l'examen S2 proprement dit."""
+    if int(session or 0) != 2:
+        return False
+    kind_s = str(kind or "")
+    name_l = str(name or "").lower()
+    return "rep" in name_l or kind_s in {"CC", "CCTP"}
+
+
 def parse_grade_cell(text: str) -> tuple[float | None, str, str | None]:
     """
     Interprète la saisie utilisateur pour une note d’assessment.
@@ -74,17 +88,26 @@ def format_grade_display(
     status: Any,
     *,
     assessment_session: int | None = None,
+    assessment_kind: str | None = None,
+    assessment_name: str | None = None,
 ) -> str:
     """
     Affichage dans les grilles de saisie.
 
-    En session 2, une ligne ``grade is None`` + ``DEF`` affiche vide : en pratique ce sont
-    quasi toujours d’anciennes cases laissées vides enregistrées à tort comme DEF ; la moyenne
-    reprend alors la S1 via les règles MCC (reprise / fallback).
-    Un vrai échec S2 se saisit à nouveau explicitement ``DEF``.
+    En session 2, un ``DEF`` sur une reprise CC/CCTP vide reste masqué (reliquat historique) ;
+    un ``DEF`` sur l'examen S2 (EE, EO, …) s'affiche normalement.
     """
     st = normalize_grade_status(status)
-    if assessment_session == 2 and grade is None and st == STATUS_DEF:
+    if (
+        assessment_session == 2
+        and grade is None
+        and st == STATUS_DEF
+        and is_s2_reprise_assessment(
+            session=assessment_session,
+            kind=assessment_kind,
+            name=assessment_name,
+        )
+    ):
         return ""
     if st in _SPECIAL_STATUSES:
         return st

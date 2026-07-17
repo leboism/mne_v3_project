@@ -22,9 +22,9 @@ JURY_EXCEL_LABELS_FR: dict[str, str] = {
 }
 
 JURY_EXCEL_EXAMPLE_ROWS: tuple[tuple[str, ...], ...] = (
-    ("Martin", "Sophie", "Professeure", "Université Paris-Saclay"),
-    ("Durand", "Paul", "Représentant professionnel", "CEA"),
-    ("Lefebvre", "Anne", "Étudiante", "Master MNE"),
+    ("Oui", "Martin", "Sophie", "Professeure", "Université Paris-Saclay"),
+    ("", "Durand", "Paul", "Représentant professionnel", "CEA"),
+    ("", "Lefebvre", "Anne", "Étudiante", "Master MNE"),
 )
 
 
@@ -44,6 +44,25 @@ def _idx_of(headers: list[str], *names: str) -> int | None:
         if n2 in headers:
             return headers.index(n2)
     return None
+
+
+def is_president_marker(value: Any) -> bool:
+    s = str(value or "").strip().lower()
+    return s in ("1", "oui", "yes", "y", "x", "true", "vrai", "président", "president", "p", "o")
+
+
+def split_jury_president_and_members(
+    members: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Retourne (président, autres membres). Si aucun désigné, le premier de la liste."""
+    if not members:
+        return None, []
+    presidents = [m for m in members if int(m.get("is_president") or 0)]
+    if presidents:
+        president = presidents[0]
+        others = [m for m in members if int(m.get("id") or 0) != int(president.get("id") or -1)]
+        return president, others
+    return members[0], members[1:]
 
 
 def parse_jury_members_workbook(path: str | Path) -> tuple[list[dict[str, str]], list[str]]:
@@ -66,6 +85,7 @@ def parse_jury_members_workbook(path: str | Path) -> tuple[list[dict[str, str]],
     col_first = _idx_of(headers, "first_name", "prenom", "firstname", "given_name")
     col_title = _idx_of(headers, "title", "qualite", "qualité", "fonction", "role")
     col_inst = _idx_of(headers, "institution", "etablissement", "établissement", "employeur")
+    col_pres = _idx_of(headers, "president", "président", "is_president", "president_du_jury")
 
     missing = []
     if col_last is None:
@@ -96,6 +116,7 @@ def parse_jury_members_workbook(path: str | Path) -> tuple[list[dict[str, str]],
                 "first_name": first_name,
                 "title": cell(row, col_title),
                 "institution": cell(row, col_inst),
+                "is_president": 1 if is_president_marker(cell(row, col_pres)) else 0,
             }
         )
 
@@ -112,7 +133,7 @@ def write_jury_import_template(path: str | Path) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "Jury"
-    ws.append(list(JURY_MEMBER_HEADERS))
+    ws.append(["Président", *JURY_MEMBER_HEADERS])
     for cell in ws[1]:
         cell.font = Font(bold=True)
     for row in JURY_EXCEL_EXAMPLE_ROWS:
@@ -125,8 +146,57 @@ def write_jury_import_template(path: str | Path) -> None:
     ins["B1"].font = Font(bold=True)
     for key in JURY_MEMBER_HEADERS:
         ins.append([key, JURY_EXCEL_LABELS_FR.get(key, "")])
+    ins.append(["president", "Oui / 1 / x pour désigner le président du jury (une seule ligne)"])
     ins.append([])
     ins.append(["Usage", "Une ligne = un membre du jury. Importez la liste complète d'un coup."])
     ins.append(["Alias FR", "nom, prénom, qualité, institution sont aussi reconnus."])
+
+    wb.save(str(path))
+
+
+def write_jury_roster_workbook(
+    members: list[dict[str, str]],
+    path: str | Path,
+    *,
+    title: str = "",
+    academic_year: str = "",
+) -> None:
+    """Exporte une composition du jury (format réimportable)."""
+    from datetime import date
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Jury"
+    headers_fr = ("Président", "Nom", "Prénom", "Qualité", "Institution")
+    ws.append(list(headers_fr))
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for m in members:
+        ws.append(
+            [
+                "Oui" if int(m.get("is_president") or 0) else "",
+                str(m.get("last_name") or ""),
+                str(m.get("first_name") or ""),
+                str(m.get("title") or ""),
+                str(m.get("institution") or ""),
+            ]
+        )
+    ws.freeze_panes = "A2"
+
+    if title or academic_year:
+        ins = wb.create_sheet("Informations")
+        ins["A1"].font = Font(bold=True)
+        ins["B1"].font = Font(bold=True)
+        ins.append(["Champ", "Valeur"])
+        if title:
+            ins.append(["Composition", title])
+        if academic_year:
+            ins.append(["Millésime", academic_year])
+        ins.append(["Exporté le", date.today().isoformat()])
+        ins.append([])
+        ins.append(["Usage", "Fichier réimportable via « Importer composition (Excel) »."])
 
     wb.save(str(path))

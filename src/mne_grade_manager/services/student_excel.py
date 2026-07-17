@@ -25,8 +25,12 @@ STUDENT_IMPORT_FIELD_KEYS: tuple[str, ...] = (
     "highest_diploma",
     "email_personal",
     "email_institutional",
+    "phone",
     "enrollment_institution",
     "application_platform",
+    "mon_master_ranking",
+    "funding",
+    "funding_other",
     "accommodations",
     "accommodations_other",
     "notes",
@@ -53,8 +57,12 @@ STUDENT_FIELD_LABEL_FR: dict[str, str] = {
     "highest_diploma": "Plus haut diplôme actuel",
     "email_personal": "Email personnel",
     "email_institutional": "Email institutionnel",
+    "phone": "Téléphone",
     "enrollment_institution": "Établissement d'inscription",
     "application_platform": "Plateforme candidature",
+    "mon_master_ranking": "Classement Mon Master",
+    "funding": "Bourses / exemptions",
+    "funding_other": "Autre bourse ou exemption",
     "accommodations": "Aménagements",
     "accommodations_other": "Autres aménagements",
     "notes": "Notes",
@@ -121,11 +129,29 @@ _HEADER_ALIASES_TO_KEY: dict[str, str] = {
     "email_institutional": "email_institutional",
     "email_inst": "email_institutional",
     "email_institutionnel": "email_institutional",
+    "phone": "phone",
+    "telephone": "phone",
+    "tel": "phone",
+    "mobile": "phone",
+    "telephone_portable": "phone",
     "enrollment_institution": "enrollment_institution",
     "etablissement_inscription": "enrollment_institution",
     "etablissement": "enrollment_institution",
     "application_platform": "application_platform",
     "plateforme_candidature": "application_platform",
+    "mon_master_ranking": "mon_master_ranking",
+    "classement_mon_master": "mon_master_ranking",
+    "classement_monmaster": "mon_master_ranking",
+    "ranking_mon_master": "mon_master_ranking",
+    "funding": "funding",
+    "bourses": "funding",
+    "bourse": "funding",
+    "bourses_exemptions": "funding",
+    "exemption_frais": "funding",
+    "exemption_frais_inscription": "funding",
+    "funding_other": "funding_other",
+    "autre_bourse": "funding_other",
+    "autres_bourses": "funding_other",
     "accommodations": "accommodations",
     "amenagement": "accommodations",
     "amenagements": "accommodations",
@@ -171,8 +197,12 @@ STUDENT_EXCEL_HEADER_LABELS_FR = {
         "highest_diploma": "ex. Licence Physique (Bac+3)",
         "email_personal": "",
         "email_institutional": "@universite-paris-saclay.fr, @ip-paris.fr, etc.",
+        "phone": "numéro de téléphone (portable ou fixe)",
         "enrollment_institution": "",
         "application_platform": "MonMaster, UPSay, IPParis…",
+        "mon_master_ranking": "ex. 1, 10, NC — optionnel",
+        "funding": "campus_france, idex, eiffel, tuition_exemption (virgules)",
+        "funding_other": "texte libre",
         "accommodations": "tiers_temps, salle_isolee, pc (virgules)",
         "accommodations_other": "texte libre",
         "notes": "commentaires",
@@ -196,8 +226,12 @@ STUDENT_EXCEL_EXAMPLE_ROW: tuple[str, ...] = (
     "Licence Physique (Bac+3)",
     "marie.dupont@gmail.com",
     "marie.dupont@universite-paris-saclay.fr",
+    "06 12 34 56 78",
     "Université Paris-Saclay",
     "MonMaster",
+    "",
+    "campus_france",
+    "",
     "tiers_temps",
     "",
     "",
@@ -220,6 +254,32 @@ _INSTRUCTIONS_ROWS: tuple[tuple[str, str], ...] = (
     ("Import", "Onglet Étudiants → Importer Excel (.xlsx)."),
     ("Export", "Mêmes en-têtes que la fiche étudiant, pour réimport ou mise à jour."),
 )
+
+
+def normalize_mon_master_ranking(raw: Any) -> str:
+    """Texte libre (rang, « NC », etc.) ; les nombres Excel sont normalisés."""
+    if raw is None:
+        return ""
+    if isinstance(raw, bool):
+        return ""
+    if isinstance(raw, int):
+        return str(raw)
+    if isinstance(raw, float):
+        if raw == int(raw):
+            return str(int(raw))
+        return str(raw).replace(".", ",")
+    s = str(raw).strip()
+    if not s:
+        return ""
+    if s.upper() == "NC":
+        return "NC"
+    try:
+        f = float(s.replace(",", "."))
+        if f == int(f):
+            return str(int(f))
+    except ValueError:
+        pass
+    return s
 
 
 def field_label_fr(key: str) -> str:
@@ -292,8 +352,12 @@ def student_dict_to_excel_row(s: dict[str, Any]) -> list[Any]:
         s.get("highest_diploma", ""),
         s.get("email_personal", ""),
         s.get("email_institutional", ""),
+        s.get("phone", ""),
         s.get("enrollment_institution", ""),
         s.get("application_platform", ""),
+        s.get("mon_master_ranking", ""),
+        s.get("funding", ""),
+        s.get("funding_other", ""),
         s.get("accommodations", ""),
         s.get("accommodations_other", ""),
         s.get("notes", ""),

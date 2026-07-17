@@ -10,6 +10,7 @@ __pycache__/
 # Build / packaging
 build/
 dist/
+release/*.zip
 *.egg-info/
 *.egg
 src/*.egg-info/

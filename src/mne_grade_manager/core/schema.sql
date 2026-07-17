@@ -11,11 +11,15 @@ CREATE TABLE IF NOT EXISTS students (
     birth_place TEXT DEFAULT '',
     email_personal TEXT DEFAULT '',
     email_institutional TEXT DEFAULT '',
+    phone TEXT DEFAULT '',
     enrollment_institution TEXT DEFAULT '',
     origin_institution TEXT DEFAULT '',
     origin_institution_country TEXT DEFAULT '',
     photo_path TEXT DEFAULT '',
     application_platform TEXT DEFAULT '',
+    mon_master_ranking TEXT DEFAULT '',
+    funding TEXT DEFAULT '',
+    funding_other TEXT DEFAULT '',
     accommodations TEXT DEFAULT '',
     accommodations_other TEXT DEFAULT '',
     notes TEXT DEFAULT '',
@@ -23,6 +27,7 @@ CREATE TABLE IF NOT EXISTS students (
     track TEXT DEFAULT '',
     academic_year TEXT DEFAULT '',
     status TEXT DEFAULT 'active',
+    mobility_type TEXT DEFAULT 'mne',
     pedagogical_contract_paper INTEGER NOT NULL DEFAULT 0
 );
 
@@ -61,7 +66,13 @@ CREATE TABLE IF NOT EXISTS courses (
     teacher_last_name TEXT DEFAULT '',
     teacher_first_name TEXT DEFAULT '',
     teacher_email TEXT DEFAULT '',
+    teacher_email_work TEXT DEFAULT '',
+    teacher_email_work_2 TEXT DEFAULT '',
+    teacher_email_personal TEXT DEFAULT '',
     teacher_phone TEXT DEFAULT '',
+    teacher_phone_work TEXT DEFAULT '',
+    teacher_phone_work_2 TEXT DEFAULT '',
+    teacher_phone_mobile TEXT DEFAULT '',
     teacher_institution TEXT DEFAULT '',
     carrier_partner TEXT DEFAULT '',
     carrier_partner_other TEXT DEFAULT '',
@@ -176,6 +187,19 @@ CREATE TABLE IF NOT EXISTS ue_jury_floor_waivers (
     FOREIGN KEY(course_id) REFERENCES courses(id) ON DELETE CASCADE
 );
 
+-- Dérogation jury : valider un bloc malgré une moyenne de bloc < 10
+CREATE TABLE IF NOT EXISTS block_jury_validation_waivers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id INTEGER NOT NULL,
+    template_id INTEGER NOT NULL,
+    block_name TEXT NOT NULL,
+    waived_at TEXT NOT NULL,
+    comment TEXT DEFAULT '',
+    UNIQUE(student_id, template_id, block_name),
+    FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,
+    FOREIGN KEY(template_id) REFERENCES templates(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS enrollments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     student_id INTEGER NOT NULL,
@@ -183,6 +207,17 @@ CREATE TABLE IF NOT EXISTS enrollments (
     UNIQUE(student_id, template_id),
     FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,
     FOREIGN KEY(template_id) REFERENCES templates(id) ON DELETE CASCADE
+);
+
+-- Inscriptions ERASMUS / mobilité : cours suivis hors parcours MNE complet
+CREATE TABLE IF NOT EXISTS student_course_enrollments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id INTEGER NOT NULL,
+    course_id INTEGER NOT NULL,
+    academic_year TEXT NOT NULL DEFAULT '',
+    UNIQUE(student_id, course_id, academic_year),
+    FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,
+    FOREIGN KEY(course_id) REFERENCES courses(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS grades (
@@ -203,6 +238,7 @@ CREATE TABLE IF NOT EXISTS jury_adjustments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     student_id INTEGER NOT NULL,
     template_id INTEGER NOT NULL,
+    jury_session_id INTEGER,
     scope TEXT NOT NULL DEFAULT 'course',
     course_id INTEGER,
     block_name TEXT DEFAULT '',
@@ -210,6 +246,7 @@ CREATE TABLE IF NOT EXISTS jury_adjustments (
     comment TEXT DEFAULT '',
     FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,
     FOREIGN KEY(template_id) REFERENCES templates(id) ON DELETE CASCADE,
+    FOREIGN KEY(jury_session_id) REFERENCES jury_sessions(id) ON DELETE SET NULL,
     FOREIGN KEY(course_id) REFERENCES courses(id) ON DELETE SET NULL
 );
 
@@ -219,11 +256,13 @@ CREATE TABLE IF NOT EXISTS second_session_decisions (
     student_id INTEGER NOT NULL,
     template_id INTEGER NOT NULL,
     course_id INTEGER NOT NULL,
+    jury_session_id INTEGER,
     sent INTEGER NOT NULL DEFAULT 0,
     comment TEXT DEFAULT '',
     UNIQUE(student_id, template_id, course_id),
     FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,
     FOREIGN KEY(template_id) REFERENCES templates(id) ON DELETE CASCADE,
+    FOREIGN KEY(jury_session_id) REFERENCES jury_sessions(id) ON DELETE SET NULL,
     FOREIGN KEY(course_id) REFERENCES courses(id) ON DELETE CASCADE
 );
 
@@ -245,6 +284,7 @@ CREATE TABLE IF NOT EXISTS jury_roster_members (
     first_name TEXT NOT NULL DEFAULT '',
     title TEXT DEFAULT '',
     institution TEXT DEFAULT '',
+    is_president INTEGER NOT NULL DEFAULT 0,
     display_order INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(roster_id) REFERENCES jury_rosters(id) ON DELETE CASCADE
 );
@@ -271,6 +311,7 @@ CREATE TABLE IF NOT EXISTS jury_members (
     first_name TEXT NOT NULL DEFAULT '',
     title TEXT DEFAULT '',
     institution TEXT DEFAULT '',
+    is_president INTEGER NOT NULL DEFAULT 0,
     display_order INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(jury_session_id) REFERENCES jury_sessions(id) ON DELETE CASCADE
 );
@@ -287,8 +328,81 @@ CREATE TABLE IF NOT EXISTS master_team_members (
     last_name TEXT NOT NULL DEFAULT '',
     first_name TEXT NOT NULL DEFAULT '',
     title TEXT DEFAULT '',
+    affiliation TEXT DEFAULT '',
     email TEXT DEFAULT '',
+    email_work TEXT DEFAULT '',
+    email_work_2 TEXT DEFAULT '',
+    email_personal TEXT DEFAULT '',
     phone TEXT DEFAULT '',
+    phone_work TEXT DEFAULT '',
+    phone_work_2 TEXT DEFAULT '',
+    phone_mobile TEXT DEFAULT '',
     notes TEXT DEFAULT '',
-    display_order INTEGER NOT NULL DEFAULT 0
+    display_order INTEGER NOT NULL DEFAULT 0,
+    post_label TEXT DEFAULT '',
+    student_id INTEGER,
+    FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE SET NULL
 );
+
+-- Emploi du temps (import Excel secrétariat : grilles semaines + référentiel cours)
+CREATE TABLE IF NOT EXISTS timetable_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    academic_year TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'M1',
+    source_filename TEXT DEFAULT '',
+    imported_at TEXT NOT NULL,
+    notes TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS timetable_reference_courses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL,
+    period TEXT NOT NULL DEFAULT 'S1',
+    block_label TEXT DEFAULT '',
+    course_title TEXT DEFAULT '',
+    legacy_code TEXT DEFAULT '',
+    mne_module_code TEXT DEFAULT '',
+    supervisors TEXT DEFAULT '',
+    hours_expected REAL DEFAULT 0,
+    ects REAL DEFAULT 0,
+    FOREIGN KEY(import_id) REFERENCES timetable_imports(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS timetable_slots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL,
+    level TEXT NOT NULL DEFAULT 'M1',
+    track TEXT NOT NULL DEFAULT 'P',
+    period TEXT NOT NULL DEFAULT 'S1',
+    week_label TEXT DEFAULT '',
+    week_number INTEGER NOT NULL DEFAULT 0,
+    week_start_date TEXT DEFAULT '',
+    day_of_week TEXT NOT NULL DEFAULT '',
+    time_slot TEXT NOT NULL DEFAULT '',
+    raw_text TEXT DEFAULT '',
+    legacy_code TEXT DEFAULT '',
+    mne_module_code TEXT DEFAULT '',
+    teacher_initials TEXT DEFAULT '',
+    room TEXT DEFAULT '',
+    slot_kind TEXT NOT NULL DEFAULT 'other',
+    fill_color TEXT DEFAULT '',
+    FOREIGN KEY(import_id) REFERENCES timetable_imports(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_timetable_slots_lookup
+    ON timetable_slots(import_id, track, period, week_number);
+
+CREATE TABLE IF NOT EXISTS timetable_weeks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL,
+    track TEXT NOT NULL DEFAULT 'P',
+    period TEXT NOT NULL DEFAULT 'S1',
+    week_number INTEGER NOT NULL DEFAULT 0,
+    week_label TEXT DEFAULT '',
+    monday_date TEXT DEFAULT '',
+    friday_date TEXT DEFAULT '',
+    FOREIGN KEY(import_id) REFERENCES timetable_imports(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_timetable_weeks_lookup
+    ON timetable_weeks(import_id, track, period, week_number);
