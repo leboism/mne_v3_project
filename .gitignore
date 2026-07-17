@@ -10,7 +10,9 @@ __pycache__/
 # Build / packaging
 build/
 dist/
-release/*.zip
+release/*
+!release/README.md
+!release/mne_v3_project-windows-build.zip
 *.egg-info/
 *.egg
 src/*.egg-info/
@@ -26,3 +28,6 @@ src/*.egg-info/
 .vscode/
 *.swp
 *.swo
+
+# Copies de conflit iCloud / Finder (« fichier 2.ext »)
+* 2.*
